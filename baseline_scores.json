@@ -1,0 +1,39 @@
+{
+  "scores": {
+    "task1_easy": 1.0,
+    "task2_medium": 0.6667,
+    "task3_hard": 0.8986
+  },
+  "metrics": {
+    "task1_easy": {
+      "total_reward": -7.0,
+      "rotation_count": 6.0,
+      "successful_ops": 7.0,
+      "illegal_actions": 0.0,
+      "rotation_score": 1.0,
+      "illegal_score": 1.0
+    },
+    "task2_medium": {
+      "total_reward": -878.0,
+      "cars_parked": 29.0,
+      "cars_retrieved": 17.0,
+      "cars_overflowed": 23.0,
+      "throughput_score": 0.6667,
+      "rotation_count": 112.0
+    },
+    "task3_hard": {
+      "total_reward": -2470.0,
+      "cars_parked": 130.0,
+      "cars_retrieved": 126.0,
+      "cars_overflowed": 44.0,
+      "rotation_count": 514.0,
+      "throughput_score": 0.8533,
+      "efficiency_score": 1.0,
+      "retrieval_score": 0.9692,
+      "stability_score": 0.7564,
+      "avg_queue_len": 2.44
+    }
+  },
+  "avg_score": 0.8550999999999999,
+  "model": "gpt-4o-mini"
+}

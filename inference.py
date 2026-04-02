@@ -1,0 +1,565 @@
+"""
+inference.py — RPOE Hybrid Inference Script
+============================================
+Hybrid decision system: LLM sets high-level goals, deterministic executor
+handles step-level rotation/park/retrieve actions.
+
+LLM call reduction: ~1080 → ~50-100 calls for Task 3.
+
+Required env vars:
+  API_BASE_URL  — LLM API endpoint (default: OpenAI)
+  MODEL_NAME    — model identifier  (default: gpt-4o-mini)
+    HF_TOKEN      — API key for the LLM provider (preferred)
+    API_KEY       — fallback API key for backward compatibility
+
+Usage:
+  python inference.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import json
+import time
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Bootstrap path so we can import without installing
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(__file__))
+load_dotenv()
+
+from server.env import RotaryParkingEnv
+from models import RPOEAction, ActionType, RPOEObservation, TaskResult
+from tasks.graders import TASKS
+
+# ---------------------------------------------------------------------------
+# Config from environment
+# ---------------------------------------------------------------------------
+
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
+API_KEY      = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY", "")
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "8"))
+LLM_RETRIES = max(1, int(os.environ.get("LLM_RETRIES", "1")))
+LLM_BACKOFF_SECONDS = float(os.environ.get("LLM_BACKOFF_SECONDS", "0.25"))
+
+if not API_KEY:
+    print("[WARN] HF_TOKEN/API_KEY not set — will run heuristic baseline only.")
+
+client = OpenAI(api_key=API_KEY or "sk-placeholder", base_url=API_BASE_URL)
+
+# ---------------------------------------------------------------------------
+# System prompt — goal-level decisions only
+# ---------------------------------------------------------------------------
+
+GOAL_SYSTEM_PROMPT = """You are a high-level planner for a rotary parking system.
+
+A deterministic executor handles step-level rotation and action execution.
+Your job is only to decide WHAT to do next, not HOW to rotate.
+
+STATE (JSON):
+- front_occupied: bool — whether slot 0 has a car
+- arrival_queue_len: number of cars waiting to park
+- retrieval_queue: list of {car_id, slot} — cars requesting exit
+- empty_slots: number of empty slots on the wheel
+- step, hour: current simulation time
+
+GOALS — output exactly one:
+    "retrieve"
+    "park"
+    "idle"
+
+DECISION STRATEGY (follow in order):
+1. If front car matches retrieval_queue[0].car_id -> choose "retrieve"
+2. Else if arrival_queue_len > 0 and front_occupied is false -> choose "park"
+3. Else if retrieval_queue is non-empty -> choose "retrieve"
+4. Else if arrival_queue_len > 0 -> choose "park"
+5. Else -> choose "idle"
+
+Respond with ONLY a JSON object: {"goal": "<goal>", "target_slot": <int or null>}
+- For "retrieve": set target_slot to retrieval_queue[0].slot
+- For "park": set target_slot to an empty slot index, preferring lower index values
+- For "idle": set target_slot to null
+
+No explanation. No markdown. Just the raw JSON.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+NUM_SLOTS = 12
+
+
+# ---------------------------------------------------------------------------
+# Executor — rotation-minimizing
+# ---------------------------------------------------------------------------
+
+def execute_goal(obs: RPOEObservation, goal: dict) -> RPOEAction:
+    """
+    Rotation-minimizing executor:
+    - Act immediately if the front slot matches what we need.
+    - Otherwise rotate toward the CLOSEST useful target (by rotation distance),
+      not the lowest index.
+    """
+
+    # 1. RETRIEVE immediately if the right car is at front
+    if obs.retrieval_queue and obs.front_car_id == obs.retrieval_queue[0].car_id:
+        return RPOEAction(action=ActionType.RETRIEVE)
+
+    # 2. PARK immediately if front is empty and cars are waiting
+    if obs.arrival_queue and not obs.front_slot_occupied:
+        return RPOEAction(action=ActionType.PARK)
+
+    # 3. HANDLE RETRIEVAL MOVEMENT
+    if obs.retrieval_queue:
+        target_car = obs.retrieval_queue[0].car_id
+
+        current_slot = next(
+            (s.index for s in obs.slots if s.car_id == target_car),
+            None
+        )
+
+        if current_slot is not None:
+            cw_dist = (12 - current_slot) % 12
+            ccw_dist = current_slot
+
+            if cw_dist <= ccw_dist:
+                return RPOEAction(action=ActionType.ROTATE_CW)
+            else:
+                return RPOEAction(action=ActionType.ROTATE_CCW)
+
+    # 4. HANDLE PARKING MOVEMENT
+    if obs.arrival_queue:
+        empty_slots = [s.index for s in obs.slots if not s.occupied]
+
+        if empty_slots:
+            target = min(empty_slots)
+
+            cw_dist = (12 - target) % 12
+            ccw_dist = target
+
+            if cw_dist <= ccw_dist:
+                return RPOEAction(action=ActionType.ROTATE_CW)
+            else:
+                return RPOEAction(action=ActionType.ROTATE_CCW)
+
+    # =========================
+    # 5. CONTEXT-AWARE FALLBACK
+    # =========================
+    # Active system: rotate if queues present
+    # Truly idle: use IDLE action to avoid wasting budget and incurring illegal penalties
+    if obs.arrival_queue or obs.retrieval_queue:
+        return RPOEAction(action=ActionType.ROTATE_CW)
+    return RPOEAction(action=ActionType.IDLE)
+
+
+# ---------------------------------------------------------------------------
+# Goal validity and completion checks
+# ---------------------------------------------------------------------------
+
+def _is_goal_valid(obs: RPOEObservation, goal: dict) -> bool:
+    """Return False if the goal can no longer be executed."""
+    g = goal.get("goal", "idle")
+    if g == "retrieve":
+        return len(obs.retrieval_queue) > 0
+    if g == "park":
+        has_arrivals = len(obs.arrival_queue) > 0
+        has_empty    = any(not s.occupied for s in obs.slots)
+        return has_arrivals and has_empty
+    return True  # idle is always valid
+
+
+def _is_goal_complete(obs: RPOEObservation, goal: dict) -> bool:
+    """Return True if the goal has been achieved and a new one is needed."""
+    g = goal.get("goal", "idle")
+    if g == "retrieve":
+        initial_len = goal.get("initial_retrieval_len")
+        if not obs.retrieval_queue:
+            return True
+        if isinstance(initial_len, int):
+            return len(obs.retrieval_queue) < initial_len
+        return False
+    if g == "park":
+        initial_len = goal.get("initial_arrival_len")
+        if isinstance(initial_len, int):
+            return len(obs.arrival_queue) < initial_len
+        return False
+    return True
+
+
+def _apply_goal_metadata(obs: RPOEObservation, goal: dict) -> dict:
+    """Attach execution metadata needed for stable goal execution."""
+    g = dict(goal)
+    goal_type = g.get("goal", "idle")
+
+    if goal_type == "retrieve" and obs.retrieval_queue:
+        g["target_slot"] = obs.retrieval_queue[0].slot_index
+        g["target_car_id"] = obs.retrieval_queue[0].car_id
+
+    if goal_type == "park":
+        if not isinstance(g.get("target_slot"), int):
+            empty_slots = sorted(
+                (s for s in obs.slots if not s.occupied),
+                key=lambda s: s.index,
+            )
+            if empty_slots:
+                g["target_slot"] = empty_slots[0].index
+
+    target_slot = g.get("target_slot")
+    if goal_type in {"retrieve", "park"} and isinstance(target_slot, int):
+        target_slot = target_slot % 12
+        g["target_slot"] = target_slot
+        # Direction will be computed dynamically during execution
+        g["direction"] = None
+    else:
+        g["direction"] = None
+
+    g["initial_retrieval_len"] = len(obs.retrieval_queue)
+    g["initial_arrival_len"] = len(obs.arrival_queue)
+    return g
+
+
+def _normalize_goal(parsed: Any) -> dict:
+    """Normalize model JSON into canonical goal dict."""
+    if not isinstance(parsed, dict):
+        return {"goal": "idle", "target_slot": None, "target_car_id": None}
+
+    raw_goal = parsed.get("goal")
+    if not isinstance(raw_goal, str):
+        goal = "idle"
+    else:
+        g = raw_goal.strip().lower()
+        alias_map = {
+            "retrieve": "retrieve",
+            "retrieval": "retrieve",
+            "park": "park",
+            "parking": "park",
+            "idle": "idle",
+            "wait": "idle",
+            "none": "idle",
+            "do_nothing": "idle",
+        }
+        goal = alias_map.get(g, "idle")
+
+    raw_slot = parsed.get("target_slot")
+    if isinstance(raw_slot, int):
+        target_slot = raw_slot % 12
+    elif isinstance(raw_slot, str) and raw_slot.strip().lstrip("-").isdigit():
+        target_slot = int(raw_slot.strip()) % 12
+    else:
+        target_slot = None
+
+    return {"goal": goal, "target_slot": target_slot, "target_car_id": None}
+
+
+def _goal_completed_transition(
+    prev_obs: RPOEObservation,
+    obs: RPOEObservation,
+    prev_action: RPOEAction,
+    goal: dict,
+) -> bool:
+    """Completion check based on previous action and state transition."""
+    g = goal.get("goal", "idle")
+
+    if g == "retrieve" and prev_action.action == ActionType.RETRIEVE:
+        return len(obs.retrieval_queue) < len(prev_obs.retrieval_queue)
+
+    if g == "park" and prev_action.action == ActionType.PARK:
+        return len(obs.arrival_queue) < len(prev_obs.arrival_queue)
+
+    if g == "idle":
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# LLM goal fetcher
+# ---------------------------------------------------------------------------
+
+def _obs_to_goal_prompt(obs: RPOEObservation) -> str:
+    """Compress observation into a concise goal-planning prompt."""
+    ret_q = [
+        {"car_id": r.car_id, "slot": r.slot_index}
+        for r in obs.retrieval_queue[:3]
+    ]
+    empty_slots = [s.index for s in obs.slots if not s.occupied]
+    data = {
+        "step":              obs.step,
+        "hour":              obs.hour,
+        "front_occupied":    obs.front_slot_occupied,
+        "arrival_queue_len": len(obs.arrival_queue),
+        "retrieval_queue":   ret_q,
+        "empty_slots":       len(empty_slots),
+        "empty_slot_indices": empty_slots[:3],
+    }
+    return json.dumps(data, separators=(",", ":"))
+
+
+def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
+    """Call LLM for a high-level goal. Falls back to heuristic goal on failure."""
+    prompt = _obs_to_goal_prompt(obs)
+
+    for attempt in range(retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "user", "content": GOAL_SYSTEM_PROMPT + "\n\nSTATE:\n" + prompt},
+                ],
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            if not raw:
+                raise ValueError("Empty response from model")
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            # Recover JSON object if extra text is present.
+            raw = raw.strip()
+            if not raw.startswith("{"):
+                s = raw.find("{")
+                e = raw.rfind("}")
+                if s != -1 and e != -1 and e > s:
+                    raw = raw[s:e + 1]
+
+            parsed = json.loads(raw)
+            goal = _normalize_goal(parsed)
+            return _apply_goal_metadata(obs, goal)
+
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(LLM_BACKOFF_SECONDS * (attempt + 1))
+            else:
+                print(f"  [WARN] LLM goal failed ({e}), using heuristic goal.")
+                return _heuristic_goal(obs)
+
+    return _heuristic_goal(obs)
+
+
+def _heuristic_goal(obs: RPOEObservation) -> dict:
+    """Derive goal deterministically — used as fallback and when API_KEY absent."""
+    # Match the prompt policy: retrieve-now, then immediate park, then rotate goals.
+    if (
+        obs.retrieval_queue
+        and obs.front_car_id == obs.retrieval_queue[0].car_id
+    ):
+        return _apply_goal_metadata(
+            obs,
+            {
+                "goal": "retrieve",
+                "target_slot": obs.retrieval_queue[0].slot_index,
+                "target_car_id": obs.retrieval_queue[0].car_id,
+            },
+        )
+
+    if obs.arrival_queue and not obs.front_slot_occupied:
+        empty_slots = sorted(
+            (s for s in obs.slots if not s.occupied),
+            key=lambda s: s.index,
+        )
+        target_slot = empty_slots[0].index if empty_slots else None
+        return _apply_goal_metadata(
+            obs,
+            {"goal": "park", "target_slot": target_slot, "target_car_id": None},
+        )
+
+    if obs.retrieval_queue:
+        return _apply_goal_metadata(
+            obs,
+            {
+                "goal": "retrieve",
+                "target_slot": obs.retrieval_queue[0].slot_index,
+                "target_car_id": obs.retrieval_queue[0].car_id,
+            },
+        )
+
+    if obs.arrival_queue and any(not s.occupied for s in obs.slots):
+        empty_slots = sorted(
+            (s for s in obs.slots if not s.occupied),
+            key=lambda s: s.index,
+        )
+        target_slot = empty_slots[0].index if empty_slots else None
+        return _apply_goal_metadata(
+            obs,
+            {"goal": "park", "target_slot": target_slot, "target_car_id": None},
+        )
+
+    return _apply_goal_metadata(
+        obs,
+        {"goal": "idle", "target_slot": None, "target_car_id": None},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid agent — maintains goal state across steps
+# ---------------------------------------------------------------------------
+
+class HybridAgent:
+    """
+    Calls LLM only when a new goal is needed.
+    Executes current goal deterministically step-by-step.
+    """
+
+    def __init__(self, use_llm: bool = True):
+        self.use_llm       = use_llm
+        self.current_goal: Optional[dict] = None
+        self.goal_cache:   dict           = {}
+        self.llm_calls:    int            = 0
+        self.prev_obs:     Optional[RPOEObservation] = None
+        self.prev_action:  Optional[RPOEAction] = None
+
+    def _state_hash(self, obs: RPOEObservation) -> int:
+        return hash(
+            str([s.car_id for s in obs.slots])
+            + str([(r.car_id, r.slot_index) for r in obs.retrieval_queue])
+            + str(len(obs.arrival_queue))
+        )
+
+    def __call__(self, obs: RPOEObservation) -> RPOEAction:
+        if (
+            self.current_goal is not None
+            and self.prev_obs is not None
+            and self.prev_action is not None
+            and _goal_completed_transition(self.prev_obs, obs, self.prev_action, self.current_goal)
+        ):
+            self.current_goal = None
+
+        need_new_goal = (
+            self.current_goal is None
+            or not _is_goal_valid(obs, self.current_goal)
+            or _is_goal_complete(obs, self.current_goal)
+        )
+
+        if need_new_goal:
+            if self.use_llm:
+                state_hash = self._state_hash(obs)
+                if state_hash in self.goal_cache:
+                    self.current_goal = _apply_goal_metadata(obs, self.goal_cache[state_hash])
+                else:
+                    self.current_goal = llm_agent(obs)
+                    self.goal_cache[state_hash] = {
+                        "goal": self.current_goal.get("goal", "idle"),
+                        "target_slot": self.current_goal.get("target_slot"),
+                        "target_car_id": self.current_goal.get("target_car_id"),
+                    }
+                    self.llm_calls += 1
+            else:
+                self.current_goal = _heuristic_goal(obs)
+
+        action = execute_goal(obs, self.current_goal)
+        self.prev_obs = obs
+        self.prev_action = action
+        return action
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible heuristic agent (for non-LLM runs)
+# ---------------------------------------------------------------------------
+
+def _heuristic_agent(obs: RPOEObservation) -> RPOEAction:
+    """Stateless heuristic — used directly when use_llm=False."""
+    return execute_goal(obs, _heuristic_goal(obs))
+
+
+# ---------------------------------------------------------------------------
+# Run all tasks
+# ---------------------------------------------------------------------------
+
+def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
+    results = {}
+
+    task_configs = [
+        ("task1_easy",   "Easy   — Rotation efficiency (50 steps)"),
+        ("task2_medium", "Medium — Peak-hour throughput (180 steps)"),
+        ("task3_hard",   "Hard   — Full day composite (1080 steps)"),
+    ]
+
+    print("\n" + "=" * 60)
+    print("  RPOE Hybrid Inference")
+    print(f"  Model  : {MODEL_NAME}")
+    print(f"  API    : {API_BASE_URL}")
+    print(f"  Mode   : {'LLM + heuristic executor' if use_llm else 'heuristic only'}")
+    print("=" * 60)
+
+    total_start = time.time()
+    completed_scores: list = []
+
+    for task_id, label in task_configs:
+        # Fresh agent per task — resets goal state and cache
+        use_llm_for_task = use_llm and task_id != "task1_easy"
+        agent = HybridAgent(use_llm=use_llm_for_task)
+
+        print(f"\n[{label}]")
+        print(f"[START] task_id={task_id} model={MODEL_NAME}")
+
+        def _make_logged(inner):
+            def _logged(obs):
+                action = inner(obs)
+                print(f"[STEP] step={obs.step} action={action.action} reward={obs.reward:.4f} done={obs.done}")
+                return action
+            return _logged
+
+        t0      = time.time()
+        result  = TASKS[task_id](agent_fn=_make_logged(agent), seed=42)
+        elapsed = time.time() - t0
+
+        results[task_id] = result
+        completed_scores.append(result.score)
+        running_avg = sum(completed_scores) / len(completed_scores)
+        print(f"[END] task_id={task_id} score={result.score:.4f} avg_score={running_avg:.4f}")
+
+        status = "PASS" if result.passed else "FAIL"
+        print(f"  Score    : {result.score:.4f}  [{status}]")
+        print(f"  Time     : {elapsed:.1f}s")
+        print(f"  LLM calls: {agent.llm_calls}")
+        print(f"  Notes    : {result.notes}")
+        for k, v in result.metrics.items():
+            print(f"    {k:<22}: {v}")
+
+    total_elapsed = time.time() - total_start
+
+    print("\n" + "=" * 60)
+    print("  FINAL SCORES")
+    print("=" * 60)
+    for task_id, result in results.items():
+        bar_len = int(result.score * 20)
+        bar     = "█" * bar_len + "░" * (20 - bar_len)
+        print(f"  {task_id:<18} {bar}  {result.score:.4f}")
+
+    avg_score = sum(r.score for r in results.values()) / len(results)
+    print(f"\n  Average score: {avg_score:.4f}")
+    print(f"  Total runtime: {total_elapsed:.1f}s  (limit: 1200s)")
+    print("=" * 60 + "\n")
+
+    output = {
+        "scores":    {tid: r.score for tid, r in results.items()},
+        "metrics":   {tid: r.metrics for tid, r in results.items()},
+        "avg_score": avg_score,
+        "model":     MODEL_NAME,
+    }
+    with open("baseline_scores.json", "w") as f:
+        json.dump(output, f, indent=2)
+    print("  Scores written to baseline_scores.json")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    use_llm = bool(API_KEY)
+    if not use_llm:
+        print("[INFO] No API_KEY — running heuristic baseline (no LLM calls).")
+    run_all_tasks(use_llm=use_llm)
