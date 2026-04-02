@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",
     "httpx>=0.28.0",
+    "huggingface-hub>=1.8.0",
 ]
 
 [project.optional-dependencies]

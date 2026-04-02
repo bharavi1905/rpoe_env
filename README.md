@@ -1,3 +1,16 @@
+---
+title: RPOE - Rotary Parking Optimization Environment
+emoji: 🅿️
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+app_port: 7860
+base_path: /web
+tags:
+  - openenv
+---
+
 # RPOE — Rotary Parking Optimization Environment
 
 A sequential decision-making environment inspired by the **KBR Park vertical rotary parking system** in Jubilee Hills, Hyderabad. An AI agent controls a 12-slot rotating wheel, deciding when to park, retrieve, and rotate under stochastic car arrival demand.
