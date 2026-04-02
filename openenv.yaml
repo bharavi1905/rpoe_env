@@ -1,0 +1,117 @@
+name: rpoe
+version: "1.0.0"
+description: >
+  Rotary Parking Optimization Environment — inspired by the KBR Park vertical
+  rotary parking system (Jubilee Hills, Hyderabad). Models sequential
+  decision-making under mechanical constraints and stochastic demand.
+
+author: "RPOE Team"
+tags:
+  - openenv
+  - parking
+  - urban-infrastructure
+  - rl
+  - scheduling
+
+environment:
+  class: rpoe.env.RotaryParkingEnv
+  entry_point: server:app
+  port: 7860
+  reset_endpoint: /reset
+  step_endpoint: /step
+  state_endpoint: /state
+
+observation_space:
+  type: dict
+  fields:
+    slots:
+      type: list[SlotState]
+      description: "12 wheel slots. Index 0 = front/accessible slot."
+    front_slot_occupied:
+      type: bool
+    front_car_id:
+      type: string | null
+    arrival_queue:
+      type: list[QueuedCar]
+      max_length: 10
+    retrieval_queue:
+      type: list[PendingRetrieval]
+      max_length: 10
+    step:
+      type: int
+      range: [0, 1080]
+    hour:
+      type: float
+      range: [0.0, 18.0]
+    total_parked:
+      type: int
+    total_retrieved:
+      type: int
+    total_overflowed:
+      type: int
+    last_action_valid:
+      type: bool
+
+action_space:
+  type: discrete
+  actions:
+    - name: rotate_cw
+      description: "Rotate wheel clockwise by one slot."
+    - name: rotate_ccw
+      description: "Rotate wheel anticlockwise by one slot."
+    - name: park
+      description: "Park front car from arrival queue. Requires front slot empty."
+    - name: retrieve
+      description: "Retrieve car at front slot. Must match retrieval_queue[0]."
+    - name: idle
+      description: "No-op action. Wait without taking any operation."
+
+reward:
+  type: float
+  min: -20.0
+  max: 5.0
+  components:
+    waiting_penalty:  "-1.0 per car in arrival + retrieval queues (per step)"
+    rotation_penalty: "-0.5 per rotation action"
+    park_bonus:       "+2.0 on successful park"
+    retrieval_bonus:  "+3.0 on successful retrieval"
+    illegal_penalty:  "-2.0 on invalid action"
+    overflow_penalty: "-5.0 per car that times out of arrival queue"
+
+tasks:
+  - id: task1_easy
+    difficulty: easy
+    max_steps: 50
+    description: "Rotation efficiency under low demand. Score = 1 - excess rotations."
+    pass_threshold: 0.4
+
+  - id: task2_medium
+    difficulty: medium
+    max_steps: 180
+    description: "Peak-hour throughput (λ=0.35/step). Score = served / (served + overflowed)."
+    pass_threshold: 0.5
+
+  - id: task3_hard
+    difficulty: hard
+    max_steps: 1080
+    description: >
+      Full 18-hour day with time-varying Poisson arrivals.
+      Composite score: 40% throughput + 25% efficiency + 20% retrieval ratio + 15% queue stability.
+    pass_threshold: 0.55
+
+episode:
+  max_steps: 1080
+  termination: "step >= max_steps"
+  seed_range: [0, 9999]
+
+dynamics:
+  arrival_process: "Poisson with time-varying rate λ(t)"
+  dwell_time: "LogNormal(mu=60steps, sigma=30steps)"
+  overflow_timeout: 15
+  wheel_size: 12
+  front_slot_constraint: true
+
+reproducibility:
+  seed_env_var: "RPOE_SEED"
+  default_seed: 42
+  baseline_scores_file: "baseline_scores.json"

@@ -1,0 +1,14 @@
+openenv-core[core]>=0.2.2
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.10.0
+numpy>=2.2.0
+openai>=1.70.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+httpx>=0.28.0
+huggingface-hub>=1.8.0
+
+[dev]
+pytest>=8.0.0
+pytest-cov>=4.0.0

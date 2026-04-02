@@ -1,0 +1,52 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-rpoe_env"
+version = "0.1.0"
+description = "OpenEnv-compliant RL environment modelling a vertical rotary parking wheel — inspired by KBR Park, Hyderabad"
+requires-python = ">=3.14"
+dependencies = [
+    # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
+    "openenv-core[core]>=0.2.2",
+    # Web framework and server
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    # Data validation
+    "pydantic>=2.10.0",
+    # Scientific computing
+    "numpy>=2.2.0",
+    # LLM inference
+    "openai>=1.70.0",
+    # Configuration and HTTP
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "httpx>=0.28.0",
+    "huggingface-hub>=1.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+# Server entry point - enables running via: uv run --project . server
+# or: python -m rpoe_env.server.app
+server = "rpoe_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["rpoe_env", "rpoe_env.server", "rpoe_env.tasks"]
+package-dir = { "rpoe_env" = ".", "rpoe_env.server" = "server", "rpoe_env.tasks" = "tasks" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
