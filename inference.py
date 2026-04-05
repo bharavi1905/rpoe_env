@@ -9,8 +9,7 @@ LLM call reduction: ~1080 → ~50-100 calls for Task 3.
 Required env vars:
   API_BASE_URL  — LLM API endpoint (default: OpenAI)
   MODEL_NAME    — model identifier  (default: gpt-4o-mini)
-    HF_TOKEN      — API key for the LLM provider (preferred)
-    API_KEY       — fallback API key for backward compatibility
+  HF_TOKEN      — API key for the LLM provider
 
 Usage:
   python inference.py
@@ -43,15 +42,15 @@ from tasks.graders import TASKS
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
-API_KEY      = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY", "")
+HF_TOKEN     = os.environ.get("HF_TOKEN")
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "8"))
 LLM_RETRIES = max(1, int(os.environ.get("LLM_RETRIES", "1")))
 LLM_BACKOFF_SECONDS = float(os.environ.get("LLM_BACKOFF_SECONDS", "0.25"))
 
-if not API_KEY:
-    print("[WARN] HF_TOKEN/API_KEY not set — will run heuristic baseline only.")
+if not HF_TOKEN:
+    print("[WARN] HF_TOKEN not set — will run heuristic baseline only.")
 
-client = OpenAI(api_key=API_KEY or "sk-placeholder", base_url=API_BASE_URL)
+client = OpenAI(api_key=HF_TOKEN or "sk-placeholder", base_url=API_BASE_URL)
 
 # ---------------------------------------------------------------------------
 # System prompt — goal-level decisions only
@@ -63,9 +62,9 @@ A deterministic executor handles step-level rotation and action execution.
 Your job is only to decide WHAT to do next, not HOW to rotate.
 
 STATE (JSON):
-- front_occupied: bool — whether slot 0 has a car
+- wheel_fronts: list of {wheel_index, front_occupied, front_car_id}
 - arrival_queue_len: number of cars waiting to park
-- retrieval_queue: list of {car_id, slot} — cars requesting exit
+- retrieval_queue: list of {car_id, wheel_index, slot} — cars requesting exit
 - empty_slots: number of empty slots on the wheel
 - step, hour: current simulation time
 
@@ -75,16 +74,16 @@ GOALS — output exactly one:
     "idle"
 
 DECISION STRATEGY (follow in order):
-1. If front car matches retrieval_queue[0].car_id -> choose "retrieve"
-2. Else if arrival_queue_len > 0 and front_occupied is false -> choose "park"
+1. If retrieval_queue[0] exists and its car is already at the front of its wheel -> choose "retrieve"
+2. Else if arrival_queue_len > 0 and any wheel front is empty -> choose "park"
 3. Else if retrieval_queue is non-empty -> choose "retrieve"
 4. Else if arrival_queue_len > 0 -> choose "park"
 5. Else -> choose "idle"
 
-Respond with ONLY a JSON object: {"goal": "<goal>", "target_slot": <int or null>}
-- For "retrieve": set target_slot to retrieval_queue[0].slot
-- For "park": set target_slot to an empty slot index, preferring lower index values
-- For "idle": set target_slot to null
+Respond with ONLY a JSON object: {"goal": "<goal>", "target_wheel": <int or null>, "target_slot": <int or null>}
+- For "retrieve": set target_wheel and target_slot from retrieval_queue[0]
+- For "park": set target_wheel to a wheel with capacity and target_slot to an empty slot index on that wheel
+- For "idle": set both target_wheel and target_slot to null
 
 No explanation. No markdown. Just the raw JSON.
 """
@@ -95,6 +94,49 @@ No explanation. No markdown. Just the raw JSON.
 # ---------------------------------------------------------------------------
 
 NUM_SLOTS = 12
+
+
+def _get_wheel(obs: RPOEObservation, wheel_index: int):
+    return obs.wheels[wheel_index]
+
+
+def _first_front_empty_wheel(obs: RPOEObservation) -> Optional[int]:
+    for wheel in obs.wheels:
+        if not wheel.front_slot_occupied:
+            return wheel.wheel_index
+    return None
+
+
+def _best_parking_candidate(obs: RPOEObservation) -> tuple[Optional[int], Optional[int], Optional[ActionType]]:
+    best_choice: tuple[int, int, int, ActionType] | None = None
+
+    for wheel in obs.wheels:
+        empty_slots = [slot.index for slot in wheel.slots if not slot.occupied]
+        if not empty_slots:
+            continue
+
+        if not wheel.front_slot_occupied:
+            return wheel.wheel_index, 0, None
+
+        wheel_size = len(wheel.slots)
+        for target_slot in empty_slots:
+            cw_dist = (wheel_size - target_slot) % wheel_size
+            ccw_dist = target_slot
+            if cw_dist <= ccw_dist:
+                direction = ActionType.ROTATE_CW
+                distance = cw_dist
+            else:
+                direction = ActionType.ROTATE_CCW
+                distance = ccw_dist
+
+            candidate = (distance, target_slot, wheel.wheel_index, direction)
+            if best_choice is None or candidate < best_choice:
+                best_choice = candidate
+
+    if best_choice is None:
+        return None, None, None
+    _, target_slot, wheel_index, direction = best_choice
+    return wheel_index, target_slot, direction
 
 
 # ---------------------------------------------------------------------------
@@ -110,45 +152,36 @@ def execute_goal(obs: RPOEObservation, goal: dict) -> RPOEAction:
     """
 
     # 1. RETRIEVE immediately if the right car is at front
-    if obs.retrieval_queue and obs.front_car_id == obs.retrieval_queue[0].car_id:
-        return RPOEAction(action=ActionType.RETRIEVE)
+    if obs.retrieval_queue:
+        retrieval = obs.retrieval_queue[0]
+        retrieval_wheel = _get_wheel(obs, retrieval.wheel_index)
+        if retrieval_wheel.front_car_id == retrieval.car_id:
+            return RPOEAction(action=ActionType.RETRIEVE, wheel_index=retrieval.wheel_index)
 
     # 2. PARK immediately if front is empty and cars are waiting
-    if obs.arrival_queue and not obs.front_slot_occupied:
-        return RPOEAction(action=ActionType.PARK)
+    if obs.arrival_queue:
+        front_empty_wheel = _first_front_empty_wheel(obs)
+        if front_empty_wheel is not None:
+            return RPOEAction(action=ActionType.PARK, wheel_index=front_empty_wheel)
 
     # 3. HANDLE RETRIEVAL MOVEMENT
     if obs.retrieval_queue:
-        target_car = obs.retrieval_queue[0].car_id
+        retrieval = obs.retrieval_queue[0]
+        current_slot = retrieval.slot_index
+        wheel_index = retrieval.wheel_index
 
-        current_slot = next(
-            (s.index for s in obs.slots if s.car_id == target_car),
-            None
-        )
+        cw_dist = (NUM_SLOTS - current_slot) % NUM_SLOTS
+        ccw_dist = current_slot
 
-        if current_slot is not None:
-            cw_dist = (12 - current_slot) % 12
-            ccw_dist = current_slot
-
-            if cw_dist <= ccw_dist:
-                return RPOEAction(action=ActionType.ROTATE_CW)
-            else:
-                return RPOEAction(action=ActionType.ROTATE_CCW)
+        if cw_dist <= ccw_dist:
+            return RPOEAction(action=ActionType.ROTATE_CW, wheel_index=wheel_index)
+        return RPOEAction(action=ActionType.ROTATE_CCW, wheel_index=wheel_index)
 
     # 4. HANDLE PARKING MOVEMENT
     if obs.arrival_queue:
-        empty_slots = [s.index for s in obs.slots if not s.occupied]
-
-        if empty_slots:
-            target = min(empty_slots)
-
-            cw_dist = (12 - target) % 12
-            ccw_dist = target
-
-            if cw_dist <= ccw_dist:
-                return RPOEAction(action=ActionType.ROTATE_CW)
-            else:
-                return RPOEAction(action=ActionType.ROTATE_CCW)
+        wheel_index, _, direction = _best_parking_candidate(obs)
+        if wheel_index is not None and direction is not None:
+            return RPOEAction(action=direction, wheel_index=wheel_index)
 
     # =========================
     # 5. CONTEXT-AWARE FALLBACK
@@ -156,8 +189,12 @@ def execute_goal(obs: RPOEObservation, goal: dict) -> RPOEAction:
     # Active system: rotate if queues present
     # Truly idle: use IDLE action to avoid wasting budget and incurring illegal penalties
     if obs.arrival_queue or obs.retrieval_queue:
-        return RPOEAction(action=ActionType.ROTATE_CW)
-    return RPOEAction(action=ActionType.IDLE)
+        fallback_wheel = goal.get("target_wheel_index")
+        wheel_count = len(obs.wheels)
+        if not isinstance(fallback_wheel, int) or fallback_wheel < 0 or fallback_wheel >= wheel_count:
+            fallback_wheel = 0
+        return RPOEAction(action=ActionType.ROTATE_CW, wheel_index=fallback_wheel)
+    return RPOEAction(action=ActionType.IDLE, wheel_index=None)
 
 
 # ---------------------------------------------------------------------------
@@ -200,23 +237,32 @@ def _apply_goal_metadata(obs: RPOEObservation, goal: dict) -> dict:
     goal_type = g.get("goal", "idle")
 
     if goal_type == "retrieve" and obs.retrieval_queue:
+        g["target_wheel_index"] = obs.retrieval_queue[0].wheel_index
         g["target_slot"] = obs.retrieval_queue[0].slot_index
         g["target_car_id"] = obs.retrieval_queue[0].car_id
 
     if goal_type == "park":
-        if not isinstance(g.get("target_slot"), int):
-            empty_slots = sorted(
-                (s for s in obs.slots if not s.occupied),
-                key=lambda s: s.index,
-            )
-            if empty_slots:
-                g["target_slot"] = empty_slots[0].index
+        if not isinstance(g.get("target_wheel_index"), int) or not isinstance(g.get("target_slot"), int):
+            target_wheel, target_slot, _ = _best_parking_candidate(obs)
+            if target_wheel is not None:
+                g["target_wheel_index"] = target_wheel
+                g["target_slot"] = target_slot
+
+    if goal_type == "idle":
+        g["target_wheel_index"] = None
+        g["target_slot"] = None
+        g["target_car_id"] = None
 
     target_slot = g.get("target_slot")
+    target_wheel = g.get("target_wheel_index")
+    wheel_count = len(obs.wheels)
     if goal_type in {"retrieve", "park"} and isinstance(target_slot, int):
-        target_slot = target_slot % 12
+        target_slot = target_slot % NUM_SLOTS
         g["target_slot"] = target_slot
-        # Direction will be computed dynamically during execution
+        if isinstance(target_wheel, int):
+            if target_wheel < 0 or target_wheel >= wheel_count:
+                target_wheel = None
+            g["target_wheel_index"] = target_wheel
         g["direction"] = None
     else:
         g["direction"] = None
@@ -229,7 +275,7 @@ def _apply_goal_metadata(obs: RPOEObservation, goal: dict) -> dict:
 def _normalize_goal(parsed: Any) -> dict:
     """Normalize model JSON into canonical goal dict."""
     if not isinstance(parsed, dict):
-        return {"goal": "idle", "target_slot": None, "target_car_id": None}
+        return {"goal": "idle", "target_wheel_index": None, "target_slot": None, "target_car_id": None}
 
     raw_goal = parsed.get("goal")
     if not isinstance(raw_goal, str):
@@ -250,13 +296,27 @@ def _normalize_goal(parsed: Any) -> dict:
 
     raw_slot = parsed.get("target_slot")
     if isinstance(raw_slot, int):
-        target_slot = raw_slot % 12
+        target_slot = raw_slot % NUM_SLOTS
     elif isinstance(raw_slot, str) and raw_slot.strip().lstrip("-").isdigit():
-        target_slot = int(raw_slot.strip()) % 12
+        target_slot = int(raw_slot.strip()) % NUM_SLOTS
     else:
         target_slot = None
 
-    return {"goal": goal, "target_slot": target_slot, "target_car_id": None}
+    raw_wheel = parsed.get("target_wheel")
+    if not isinstance(raw_wheel, int):
+        raw_wheel = parsed.get("wheel_index")
+    if isinstance(raw_wheel, int):
+        target_wheel = raw_wheel
+    elif isinstance(raw_wheel, str) and raw_wheel.strip().lstrip("-").isdigit():
+        target_wheel = int(raw_wheel.strip())
+    else:
+        target_wheel = None
+
+    # Clamp to valid range; None stays None (resolved later by _apply_goal_metadata)
+    if isinstance(target_wheel, int) and target_wheel < 0:
+        target_wheel = None
+
+    return {"goal": goal, "target_wheel_index": target_wheel, "target_slot": target_slot, "target_car_id": None}
 
 
 def _goal_completed_transition(
@@ -287,18 +347,28 @@ def _goal_completed_transition(
 def _obs_to_goal_prompt(obs: RPOEObservation) -> str:
     """Compress observation into a concise goal-planning prompt."""
     ret_q = [
-        {"car_id": r.car_id, "slot": r.slot_index}
+        {"car_id": r.car_id, "wheel_index": r.wheel_index, "slot": r.slot_index}
         for r in obs.retrieval_queue[:3]
     ]
-    empty_slots = [s.index for s in obs.slots if not s.occupied]
+    empty_slots = [s for s in obs.slots if not s.occupied]
     data = {
         "step":              obs.step,
         "hour":              obs.hour,
-        "front_occupied":    obs.front_slot_occupied,
+        "wheel_fronts": [
+            {
+                "wheel_index": wheel.wheel_index,
+                "front_occupied": wheel.front_slot_occupied,
+                "front_car_id": wheel.front_car_id,
+            }
+            for wheel in obs.wheels
+        ],
         "arrival_queue_len": len(obs.arrival_queue),
         "retrieval_queue":   ret_q,
         "empty_slots":       len(empty_slots),
-        "empty_slot_indices": empty_slots[:3],
+        "empty_slot_indices": [
+            {"wheel_index": slot.wheel_index, "slot": slot.index}
+            for slot in empty_slots[:5]
+        ],
     }
     return json.dumps(data, separators=(",", ":"))
 
@@ -310,13 +380,14 @@ def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "user", "content": GOAL_SYSTEM_PROMPT + "\n\nSTATE:\n" + prompt},
-                ],
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "user", "content": GOAL_SYSTEM_PROMPT + "\n\nSTATE:\n" + prompt},
+                    ],
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
             raw = (resp.choices[0].message.content or "").strip()
+            
             if not raw:
                 raise ValueError("Empty response from model")
             if raw.startswith("```"):
@@ -347,56 +418,56 @@ def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
 
 
 def _heuristic_goal(obs: RPOEObservation) -> dict:
-    """Derive goal deterministically — used as fallback and when API_KEY absent."""
+    """Derive goal deterministically — used as fallback and when HF_TOKEN absent."""
     # Match the prompt policy: retrieve-now, then immediate park, then rotate goals.
     if (
         obs.retrieval_queue
-        and obs.front_car_id == obs.retrieval_queue[0].car_id
+        and _get_wheel(obs, obs.retrieval_queue[0].wheel_index).front_car_id == obs.retrieval_queue[0].car_id
     ):
         return _apply_goal_metadata(
             obs,
             {
                 "goal": "retrieve",
+                "target_wheel_index": obs.retrieval_queue[0].wheel_index,
                 "target_slot": obs.retrieval_queue[0].slot_index,
                 "target_car_id": obs.retrieval_queue[0].car_id,
             },
         )
 
-    if obs.arrival_queue and not obs.front_slot_occupied:
-        empty_slots = sorted(
-            (s for s in obs.slots if not s.occupied),
-            key=lambda s: s.index,
-        )
-        target_slot = empty_slots[0].index if empty_slots else None
-        return _apply_goal_metadata(
-            obs,
-            {"goal": "park", "target_slot": target_slot, "target_car_id": None},
-        )
+    if obs.arrival_queue:
+        front_empty_wheel = _first_front_empty_wheel(obs)
+        if front_empty_wheel is not None:
+            return _apply_goal_metadata(
+                obs,
+                {"goal": "park", "target_wheel_index": front_empty_wheel, "target_slot": 0, "target_car_id": None},
+            )
 
     if obs.retrieval_queue:
         return _apply_goal_metadata(
             obs,
             {
                 "goal": "retrieve",
+                "target_wheel_index": obs.retrieval_queue[0].wheel_index,
                 "target_slot": obs.retrieval_queue[0].slot_index,
                 "target_car_id": obs.retrieval_queue[0].car_id,
             },
         )
 
     if obs.arrival_queue and any(not s.occupied for s in obs.slots):
-        empty_slots = sorted(
-            (s for s in obs.slots if not s.occupied),
-            key=lambda s: s.index,
-        )
-        target_slot = empty_slots[0].index if empty_slots else None
+        target_wheel, target_slot, _ = _best_parking_candidate(obs)
         return _apply_goal_metadata(
             obs,
-            {"goal": "park", "target_slot": target_slot, "target_car_id": None},
+            {
+                "goal": "park",
+                "target_wheel_index": target_wheel,
+                "target_slot": target_slot,
+                "target_car_id": None,
+            },
         )
 
     return _apply_goal_metadata(
         obs,
-        {"goal": "idle", "target_slot": None, "target_car_id": None},
+        {"goal": "idle", "target_wheel_index": None, "target_slot": None, "target_car_id": None},
     )
 
 
@@ -420,8 +491,8 @@ class HybridAgent:
 
     def _state_hash(self, obs: RPOEObservation) -> int:
         return hash(
-            str([s.car_id for s in obs.slots])
-            + str([(r.car_id, r.slot_index) for r in obs.retrieval_queue])
+            str([(slot.wheel_index, slot.index, slot.car_id) for slot in obs.slots])
+            + str([(r.car_id, r.wheel_index, r.slot_index) for r in obs.retrieval_queue])
             + str(len(obs.arrival_queue))
         )
 
@@ -449,6 +520,7 @@ class HybridAgent:
                     self.current_goal = llm_agent(obs)
                     self.goal_cache[state_hash] = {
                         "goal": self.current_goal.get("goal", "idle"),
+                        "target_wheel_index": self.current_goal.get("target_wheel_index"),
                         "target_slot": self.current_goal.get("target_slot"),
                         "target_car_id": self.current_goal.get("target_car_id"),
                     }
@@ -479,7 +551,8 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
     results = {}
 
     task_configs = [
-        ("task1_easy",   "Easy   — Rotation efficiency (50 steps)"),
+        ("task1_easy",   ""
+        ""),
         ("task2_medium", "Medium — Peak-hour throughput (180 steps)"),
         ("task3_hard",   "Hard   — Full day composite (1080 steps)"),
     ]
@@ -559,7 +632,7 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    use_llm = bool(API_KEY)
+    use_llm = bool(HF_TOKEN)
     if not use_llm:
-        print("[INFO] No API_KEY — running heuristic baseline (no LLM calls).")
+        print("[INFO] No HF_TOKEN — running heuristic baseline (no LLM calls).")
     run_all_tasks(use_llm=use_llm)

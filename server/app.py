@@ -43,8 +43,11 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 from models import RPOEAction, RPOEObservation, ActionType, TaskResult
-from server.env import RotaryParkingEnv
+from server.env import RotaryParkingEnv, WHEEL_COUNT
 from tasks.graders import TASKS
+
+
+RPOEAction.configure_wheel_count(WHEEL_COUNT)
 
 
 # Create the app with web interface and README integration
@@ -105,7 +108,9 @@ def run_task(task_id: str, seed: int = 42) -> TaskResult:
         )
 
     def random_agent(_):
-        return RPOEAction(action=random.choice(list(ActionType)))
+        action = random.choice(list(ActionType))
+        wheel_index = None if action == ActionType.IDLE else random.randrange(WHEEL_COUNT)
+        return RPOEAction(action=action, wheel_index=wheel_index)
 
     return TASKS[task_id](random_agent, seed=seed)
 

@@ -24,13 +24,12 @@ environment:
 observation_space:
   type: dict
   fields:
+    wheels:
+      type: list[WheelState]
+      description: "Seven rotary wheels, each exposing a front/accessible slot at index 0."
     slots:
       type: list[SlotState]
-      description: "12 wheel slots. Index 0 = front/accessible slot."
-    front_slot_occupied:
-      type: bool
-    front_car_id:
-      type: string | null
+      description: "Flattened view of all 84 slots across 7 wheels."
     arrival_queue:
       type: list[QueuedCar]
       max_length: 10
@@ -108,6 +107,7 @@ dynamics:
   arrival_process: "Poisson with time-varying rate λ(t)"
   dwell_time: "LogNormal(mu=60steps, sigma=30steps)"
   overflow_timeout: 15
+  wheel_count: 7
   wheel_size: 12
   front_slot_constraint: true
 
