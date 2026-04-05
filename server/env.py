@@ -20,7 +20,7 @@ from openenv.core.env_server.interfaces import Environment
 from models import (
     RPOEAction, ActionType, RPOEObservation, RPOEState,
     Reward, RewardBreakdown,
-    SlotState, QueuedCar, PendingRetrieval,
+    SlotState, WheelState, QueuedCar, PendingRetrieval,
 )
 
 
@@ -29,10 +29,12 @@ from models import (
 # ---------------------------------------------------------------------------
 
 WHEEL_SIZE       = 12          # slots per wheel (one rotary stack)
+WHEEL_COUNT      = 7           # number of independent rotary stacks
 MAX_ARRIVAL_Q    = 10          # max cars waiting outside
 MAX_RETRIEVAL_Q  = 10          # max pending retrievals
 MAX_STEPS        = 1080        # 18-hour day in 1-min steps (5 AM – 11 PM)
 OVERFLOW_TIMEOUT = 15          # steps before queued car overflows (rage-leaves)
+TRAFFIC_MULTIPLIER = 1.0       # scales the baseline arrival rates
 
 # Poisson arrival rates (cars/step) by hour-of-day band
 ARRIVAL_RATES = [
@@ -73,17 +75,20 @@ def _sample_dwell() -> int:
 
 class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
     """
-    OpenEnv-compliant environment modelling a 12-slot vertical rotary
-    parking wheel. Only the front-facing slot (index 0) is accessible.
+    OpenEnv-compliant environment modelling one or more 12-slot vertical
+    rotary parking wheels. Only the front-facing slot (index 0) of each
+    wheel is accessible.
 
-    The agent must rotate the wheel (CW / CCW) to align the correct slot
-    before parking or retrieving. Stochastic arrivals follow a Poisson
+    The agent must rotate a target wheel (CW / CCW) to align the correct
+    slot before parking or retrieving. Stochastic arrivals follow a Poisson
     process with time-of-day varying rate.
 
     Args:
         seed: RNG seed for reproducibility.
         max_steps: Episode length in simulation steps (default 1080 = 18 hrs).
-        wheel_size: Number of slots on the wheel (default 12).
+        wheel_count: Number of independent rotary wheels (default 7).
+        wheel_size: Number of slots per wheel (default 12).
+        traffic_multiplier: Multiplier applied to baseline arrival rates.
     """
 
     metadata = {"render.modes": ["human", "ansi"]}
@@ -92,16 +97,27 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         self,
         seed: int = 42,
         max_steps: int = MAX_STEPS,
+        wheel_count: int = WHEEL_COUNT,
         wheel_size: int = WHEEL_SIZE,
+        traffic_multiplier: float = TRAFFIC_MULTIPLIER,
     ):
         super().__init__()
 
         self.seed_val   = seed
         self.max_steps  = max_steps
+        self.wheel_count = wheel_count
         self.wheel_size = wheel_size
+        self.traffic_multiplier = traffic_multiplier
+
+        if self.wheel_count < 1:
+            raise ValueError("wheel_count must be at least 1")
+        if self.wheel_size < 1:
+            raise ValueError("wheel_size must be at least 1")
+        if self.traffic_multiplier <= 0:
+            raise ValueError("traffic_multiplier must be positive")
 
         # Will be fully initialised in reset()
-        self._slots: List[Optional[str]]          = []   # car_id or None
+        self._slots: List[List[Optional[str]]]    = []   # [wheel][slot] -> car_id or None
         self._arrival_q: List[QueuedCar]          = []
         self._retrieval_q: List[PendingRetrieval] = []
         self._dwell_timers: Dict[str, int]        = {}   # car_id → step to request exit
@@ -135,7 +151,10 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
 
-        self._slots          = [None] * self.wheel_size
+        self._slots          = [
+            [None] * self.wheel_size
+            for _ in range(self.wheel_count)
+        ]
         self._arrival_q      = []
         self._retrieval_q    = []
         self._dwell_timers   = {}
@@ -162,11 +181,14 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         """
         self._step += 1
         act = ActionType(action.action)
+        wheel_index = action.wheel_index
         self._last_action = act.value
+
+        valid_wheel = isinstance(wheel_index, int) and 0 <= wheel_index < self.wheel_count
 
         # ── 1. Stochastic arrivals ──────────────────────────────────────────
         hour   = self._current_hour()
-        lam    = _arrival_rate(hour)
+        lam    = _arrival_rate(hour) * self.traffic_multiplier
         n_new  = np.random.poisson(lam)
         for _ in range(n_new):
             if len(self._arrival_q) < MAX_ARRIVAL_Q:
@@ -178,11 +200,13 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         # ── 2. Dwell timer expiry → retrieval requests ────────────────────
         for car_id, exit_step in list(self._dwell_timers.items()):
             if self._step >= exit_step:
-                slot_idx = self._find_car(car_id)
-                if slot_idx is not None and len(self._retrieval_q) < MAX_RETRIEVAL_Q:
+                car_location = self._find_car(car_id)
+                if car_location is not None and len(self._retrieval_q) < MAX_RETRIEVAL_Q:
+                    wheel_idx, slot_idx = car_location
                     self._retrieval_q.append(
                         PendingRetrieval(
                             car_id=car_id,
+                            wheel_index=wheel_idx,
                             slot_index=slot_idx,
                             requested_at_step=self._step,
                         )
@@ -205,20 +229,23 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         park_bonus       = 0.0
         retrieval_bonus  = 0.0
         illegal_penalty  = 0.0
-        valid            = True
+        valid            = act == ActionType.IDLE or valid_wheel
 
-        if act == ActionType.ROTATE_CW:
-            self._slots = [self._slots[-1]] + self._slots[:-1]
+        if act != ActionType.IDLE and not valid_wheel:
+            illegal_penalty = 2.0
+
+        elif act == ActionType.ROTATE_CW:
+            self._slots[wheel_index] = [self._slots[wheel_index][-1]] + self._slots[wheel_index][:-1]
             rotation_penalty = 0.5
 
         elif act == ActionType.ROTATE_CCW:
-            self._slots = self._slots[1:] + [self._slots[0]]
+            self._slots[wheel_index] = self._slots[wheel_index][1:] + [self._slots[wheel_index][0]]
             rotation_penalty = 0.5
 
         elif act == ActionType.PARK:
-            if self._arrival_q and self._slots[0] is None:
+            if self._arrival_q and self._slots[wheel_index][0] is None:
                 qcar = self._arrival_q.pop(0)
-                self._slots[0] = qcar.car_id
+                self._slots[wheel_index][0] = qcar.car_id
                 dwell = _sample_dwell()
                 self._dwell_timers[qcar.car_id] = self._step + dwell
                 self._total_parked += 1
@@ -228,12 +255,13 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
                 illegal_penalty = 2.0
 
         elif act == ActionType.RETRIEVE:
-            front_car = self._slots[0]
+            front_car = self._slots[wheel_index][0]
             if (front_car is not None
                     and self._retrieval_q
-                    and self._retrieval_q[0].car_id == front_car):
+                    and self._retrieval_q[0].car_id == front_car
+                    and self._retrieval_q[0].wheel_index == wheel_index):
                 self._retrieval_q.pop(0)
-                self._slots[0] = None
+                self._slots[wheel_index][0] = None
                 self._total_retrieved += 1
                 retrieval_bonus = 3.0
             else:
@@ -284,24 +312,19 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         return RPOEState(
             episode_id=self._episode_id,
             step_count=self._step,
-            slots=[
-                SlotState(
-                    index=i,
-                    occupied=self._slots[i] is not None,
-                    car_id=self._slots[i],
-                )
-                for i in range(self.wheel_size)
-            ],
-            front_slot_index=0,
+            wheels=self._make_wheels_state(),
+            slots=self._make_flat_slots(),
             arrival_queue=list(self._arrival_q),
             retrieval_queue=list(self._retrieval_q),
             hour=self._current_hour(),
             episode_done=self._step >= self.max_steps,
             seed=self.seed_val,
             config={
+                "wheel_count": self.wheel_count,
                 "wheel_size": self.wheel_size,
                 "max_steps":  self.max_steps,
                 "overflow_timeout": OVERFLOW_TIMEOUT,
+                "traffic_multiplier": self.traffic_multiplier,
             },
         )
 
@@ -313,12 +336,48 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         """Map simulation step → hour of day (0 = 5 AM open, 18 = 11 PM close)."""
         return (self._step / self.max_steps) * 18.0
 
-    def _find_car(self, car_id: str) -> Optional[int]:
-        """Return slot index of a car, or None if not found."""
-        for i, cid in enumerate(self._slots):
-            if cid == car_id:
-                return i
+    def _find_car(self, car_id: str) -> Optional[tuple[int, int]]:
+        """Return wheel and slot index of a car, or None if not found."""
+        for wheel_index, wheel_slots in enumerate(self._slots):
+            for slot_index, cid in enumerate(wheel_slots):
+                if cid == car_id:
+                    return wheel_index, slot_index
         return None
+
+    def _make_flat_slots(self) -> List[SlotState]:
+        return [
+            SlotState(
+                wheel_index=wheel_index,
+                index=slot_index,
+                occupied=wheel_slots[slot_index] is not None,
+                car_id=wheel_slots[slot_index],
+            )
+            for wheel_index, wheel_slots in enumerate(self._slots)
+            for slot_index in range(self.wheel_size)
+        ]
+
+    def _make_wheels_state(self) -> List[WheelState]:
+        wheels = []
+        for wheel_index, wheel_slots in enumerate(self._slots):
+            slot_states = [
+                SlotState(
+                    wheel_index=wheel_index,
+                    index=slot_index,
+                    occupied=wheel_slots[slot_index] is not None,
+                    car_id=wheel_slots[slot_index],
+                )
+                for slot_index in range(self.wheel_size)
+            ]
+            wheels.append(
+                WheelState(
+                    wheel_index=wheel_index,
+                    front_slot_index=0,
+                    front_slot_occupied=wheel_slots[0] is not None,
+                    front_car_id=wheel_slots[0],
+                    slots=slot_states,
+                )
+            )
+        return wheels
 
     def _make_obs(
         self,
@@ -326,18 +385,10 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
         reward_total: float = 0.0,
         reward_breakdown: Optional[RewardBreakdown] = None,
     ) -> RPOEObservation:
-        slots_obs = [
-            SlotState(
-                index=i,
-                occupied=self._slots[i] is not None,
-                car_id=self._slots[i],
-            )
-            for i in range(self.wheel_size)
-        ]
         return RPOEObservation(
-            slots=slots_obs,
-            front_slot_occupied=self._slots[0] is not None,
-            front_car_id=self._slots[0],
+            wheel_count=self.wheel_count,
+            wheels=self._make_wheels_state(),
+            slots=self._make_flat_slots(),
             arrival_queue=list(self._arrival_q),
             retrieval_queue=list(self._retrieval_q),
             step=self._step,
@@ -359,10 +410,12 @@ class RotaryParkingEnv(Environment[RPOEAction, RPOEObservation, RPOEState]):
     def render(self, mode: str = "human") -> str:
         hour_label = f"{int(5 + self._current_hour()):02d}:00"
         wheel_vis  = ""
-        for i, cid in enumerate(self._slots):
-            marker = "►" if i == 0 else " "
-            slot   = f"[{cid[:8] if cid else '  EMPTY  '}]"
-            wheel_vis += f"  {marker} {i:2d} {slot}\n"
+        for wheel_index, wheel_slots in enumerate(self._slots):
+            wheel_vis += f"  Wheel {wheel_index}\n"
+            for slot_index, cid in enumerate(wheel_slots):
+                marker = "►" if slot_index == 0 else " "
+                slot   = f"[{cid[:8] if cid else '  EMPTY  '}]"
+                wheel_vis += f"    {marker} {slot_index:2d} {slot}\n"
 
         out = (
             f"\n{'='*50}\n"

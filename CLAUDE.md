@@ -205,11 +205,11 @@ These are the ground truth scores. Do not regress these.
 Update this section after every inference.py run.
 
 ```
-task1_easy:   TBD  ← re-run inference.py to verify with IDLE
-task2_medium: TBD  ← re-run inference.py to verify
-task3_hard:   TBD  ← re-run inference.py to verify
-average:      TBD
-runtime:      ~630s  ← well within 1200s limit
+task1_easy:   1.0000
+task2_medium: 0.9054
+task3_hard:   0.9016
+average:      0.9357
+runtime:      320.9s  ← well within 1200s limit
 ```
 
 README baseline table must match these numbers exactly.
@@ -341,3 +341,41 @@ Step 5: Produce a summary with:
 - Meta + HuggingFace engineers review for real-world utility
 - Creativity and exploit checks
 - Code quality review
+
+---
+
+## Pre-Submission Checklist (5 items — all must pass)
+
+Verify each item against inference.py before submitting.
+
+- [ ] **1. Followed sample inference.py strictly**
+  Read the official sample and confirmed all conventions are followed.
+
+- [ ] **2. Environment variables present in inference.py**
+  Required: `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`
+  Optional (only if using `from_docker_image()`): `LOCAL_IMAGE_NAME`
+
+- [ ] **3. Defaults set only for API_BASE_URL and MODEL_NAME — NOT HF_TOKEN**
+  ```python
+  API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-endpoint>")
+  MODEL_NAME   = os.getenv("MODEL_NAME",   "<your-active-model>")
+  HF_TOKEN     = os.getenv("HF_TOKEN")
+
+  # Optional — if you use from_docker_image():
+  LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+  ```
+
+- [ ] **4. All LLM calls use the OpenAI client configured via these variables**
+  ```python
+  from openai import OpenAI
+  client = OpenAI(api_key=HF_TOKEN or "sk-placeholder", base_url=API_BASE_URL)
+  ```
+  No Anthropic client. No direct `requests` calls to LLM endpoints.
+
+- [ ] **5. Stdout logs follow the required structured format exactly**
+  ```
+  [START] task_id=<id> model=<model>
+  [STEP] step=<n> action=<action> reward=<float> done=<bool>
+  [END] task_id=<id> score=<float> avg_score=<float>
+  ```
+  Field names, ordering, and format must match exactly — no deviation.
