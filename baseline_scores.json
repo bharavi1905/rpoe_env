@@ -1,39 +1,39 @@
 {
   "scores": {
     "task1_easy": 1.0,
-    "task2_medium": 0.6667,
-    "task3_hard": 0.8986
+    "task2_medium": 0.6282,
+    "task3_hard": 0.8663
   },
   "metrics": {
     "task1_easy": {
-      "total_reward": -7.0,
-      "rotation_count": 6.0,
-      "successful_ops": 7.0,
+      "total_reward": 1.0,
+      "rotation_count": 2.0,
+      "successful_ops": 3.0,
       "illegal_actions": 0.0,
       "rotation_score": 1.0,
       "illegal_score": 1.0
     },
     "task2_medium": {
-      "total_reward": -878.0,
-      "cars_parked": 29.0,
-      "cars_retrieved": 17.0,
-      "cars_overflowed": 23.0,
-      "throughput_score": 0.6667,
-      "rotation_count": 112.0
+      "total_reward": -1543.5,
+      "cars_parked": 30.0,
+      "cars_retrieved": 19.0,
+      "cars_overflowed": 29.0,
+      "throughput_score": 0.6282,
+      "rotation_count": 115.0
     },
     "task3_hard": {
-      "total_reward": -2470.0,
-      "cars_parked": 130.0,
-      "cars_retrieved": 126.0,
-      "cars_overflowed": 44.0,
-      "rotation_count": 514.0,
-      "throughput_score": 0.8533,
+      "total_reward": -3655.0,
+      "cars_parked": 107.0,
+      "cars_retrieved": 105.0,
+      "cars_overflowed": 53.0,
+      "rotation_count": 638.0,
+      "throughput_score": 0.8,
       "efficiency_score": 1.0,
-      "retrieval_score": 0.9692,
-      "stability_score": 0.7564,
-      "avg_queue_len": 2.44
+      "retrieval_score": 0.9813,
+      "stability_score": 0.6669,
+      "avg_queue_len": 3.33
     }
   },
-  "avg_score": 0.8550999999999999,
-  "model": "gpt-4o-mini"
+  "avg_score": 0.8315,
+  "model": "claude-haiku-4-5"
 }

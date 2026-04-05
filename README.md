@@ -13,7 +13,7 @@ tags:
 
 # RPOE — Rotary Parking Optimization Environment
 
-A sequential decision-making environment inspired by the **KBR Park vertical rotary parking system** in Jubilee Hills, Hyderabad. An AI agent controls a 12-slot rotating wheel, deciding when to park, retrieve, and rotate under stochastic car arrival demand.
+A sequential decision-making environment inspired by the **KBR Park vertical rotary parking system** in Jubilee Hills, Hyderabad. An AI agent controls 7 independent 12-slot rotating wheels, deciding when to park, retrieve, and rotate under stochastic car arrival demand.
 
 > To our knowledge, RPOE is the first OpenEnv environment modelling South Asian urban parking infrastructure and vertical rotary mechanical systems.
 
@@ -21,7 +21,7 @@ A sequential decision-making environment inspired by the **KBR Park vertical rot
 
 ## Real-World Motivation
 
-KBR Park operates a vertical rotary car-parking tower: cars are loaded onto a rotating wheel, which must be rotated to bring the target slot to the front access point before a car can be parked or retrieved. The system must serve a continuous stream of arrivals and retrievals under time-varying demand, minimising queue overflow and mechanical rotation cost. RPOE models this at full fidelity for a single 12-slot stack.
+KBR Park operates a vertical rotary car-parking tower: cars are loaded onto a rotating wheel, which must be rotated to bring the target slot to the front access point before a car can be parked or retrieved. The system must serve a continuous stream of arrivals and retrievals under time-varying demand, minimising queue overflow and mechanical rotation cost. RPOE models 7 stacks at full fidelity, each with 12 slots.
 
 ![KBR Park Vertical Rotary Parking System](./assets/kbr_park_rotary.webp)
 *The actual KBR Park rotary parking facility during trial run (June 2025) — 15m tall, 72 slots across 6 stacks, each stack holding 12 cars. Photo: Deccan Chronicle / Nabinder Bommala.*
@@ -29,7 +29,7 @@ KBR Park operates a vertical rotary car-parking tower: cars are loaded onto a ro
 ![KBR Park Rotary Parking Towers — Street View](./assets/kbr_park_rotary.jpg)
 *All 6 rotary stacks viewed from the street outside KBR Park, Jubilee Hills, Hyderabad. Photo: Telangana Today.*
 
-> **Note on scale:** The physical KBR Park system uses 72 slots across multiple stacks. This environment models a single 12-slot stack at full fidelity. Multi-stack simulation is left as a future extension.
+> **Note on scale:** The physical KBR Park system uses 72 slots across multiple stacks. This environment now models 7 full 12-slot stacks, for 84 simulated slots in total.
 
 **What a trained agent here generalises to:**
 - Warehouse Automated Storage and Retrieval Systems (AS/RS)
@@ -217,7 +217,7 @@ rpoe_env/
 ├── baseline_scores.json    # Written by inference.py after run
 ├── server/
 │   ├── app.py              # FastAPI app — /reset, /step, /state, /tasks, /task/{id}
-│   └── env.py              # RotaryParkingEnv (12-slot wheel simulation)
+│   └── env.py              # RotaryParkingEnv (7 wheels × 12 slots)
 ├── tasks/
 │   └── graders.py          # run_task1/2/3, TASKS registry
 └── tests/

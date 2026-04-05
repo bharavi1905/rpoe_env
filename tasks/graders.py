@@ -258,7 +258,7 @@ if __name__ == "__main__":
     import random
 
     def random_agent(_):
-        return RPOEAction(action=random.choice(list(ActionType)))
+        return RPOEAction(action=random.choice(list(ActionType)), wheel_index=0)
 
     for task_id, fn in TASKS.items():
         result = fn(random_agent, seed=42)

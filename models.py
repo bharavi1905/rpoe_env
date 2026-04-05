@@ -5,8 +5,8 @@ All OpenEnv spec types live here.
 
 from __future__ import annotations
 from enum import Enum
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, ConfigDict, Field
+from typing import ClassVar, List, Optional, Dict, Any
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openenv.core.env_server.types import Action, Observation, State
 
@@ -24,6 +24,8 @@ class ActionType(str, Enum):
 
 
 class RPOEAction(Action):
+    _wheel_count: ClassVar[int] = 7
+
     model_config = ConfigDict(
         extra="forbid",
         validate_assignment=True,
@@ -32,6 +34,40 @@ class RPOEAction(Action):
     )
 
     action: ActionType = Field(..., description="One of: rotate_cw, rotate_ccw, park, retrieve, idle")
+    wheel_index: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Target wheel index for the action; null is allowed only for idle.",
+    )
+
+    @classmethod
+    def configure_wheel_count(cls, wheel_count: int) -> None:
+        if wheel_count < 1:
+            raise ValueError("wheel_count must be at least 1")
+        cls._wheel_count = wheel_count
+
+    @classmethod
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        schema = super().model_json_schema(*args, **kwargs)
+        wheel_index = schema.get("properties", {}).get("wheel_index")
+        if wheel_index is not None:
+            wheel_index["minimum"] = 0
+            wheel_index["maximum"] = cls._wheel_count - 1
+            wheel_index["description"] = (
+                "Target wheel index for the action. "
+                f"Valid values are 0-{cls._wheel_count - 1}; null is allowed only for idle."
+            )
+        return schema
+
+    @model_validator(mode="after")
+    def validate_wheel_index(self) -> "RPOEAction":
+        if self.action == ActionType.IDLE:
+            return self
+        if self.wheel_index is None:
+            raise ValueError("wheel_index is required for non-idle actions")
+        if self.wheel_index >= self._wheel_count:
+            raise ValueError(f"wheel_index must be between 0 and {self._wheel_count - 1}")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -39,9 +75,18 @@ class RPOEAction(Action):
 # ---------------------------------------------------------------------------
 
 class SlotState(BaseModel):
-    index: int = Field(..., description="Slot index 0–11; 0 is the front/accessible position")
+    wheel_index: int = Field(..., description="Wheel containing this slot")
+    index: int = Field(..., description="Slot index within the wheel; 0 is the front/accessible position")
     occupied: bool = Field(..., description="True if a car occupies this slot")
     car_id: Optional[str] = Field(default=None, description="Car identifier, or None if slot is empty")
+
+
+class WheelState(BaseModel):
+    wheel_index: int = Field(..., description="Wheel identifier")
+    front_slot_index: int = Field(..., description="Front slot index for this wheel")
+    front_slot_occupied: bool = Field(..., description="True if the front slot currently holds a car")
+    front_car_id: Optional[str] = Field(default=None, description="Car ID at the accessible slot, or None if empty")
+    slots: List[SlotState] = Field(..., description="All slots in this wheel")
 
 
 class QueuedCar(BaseModel):
@@ -51,6 +96,7 @@ class QueuedCar(BaseModel):
 
 class PendingRetrieval(BaseModel):
     car_id: str = Field(..., description="Unique car identifier requesting retrieval")
+    wheel_index: int = Field(..., description="Wheel containing the car requesting retrieval")
     slot_index: int = Field(..., description="Wheel slot where the car currently sits")
     requested_at_step: int = Field(..., description="Simulation step at which retrieval was requested")
 
@@ -79,9 +125,9 @@ class Reward(BaseModel):
 
 class RPOEObservation(Observation):
     # Wheel state
-    slots: List[SlotState] = Field(..., description="All 12 wheel slots; index 0 is the front/accessible slot")
-    front_slot_occupied: bool = Field(..., description="True if the front slot currently holds a car")
-    front_car_id: Optional[str] = Field(..., description="Car ID at the accessible slot, or None if empty")
+    wheel_count: int = Field(..., description="Number of rotary wheels in the installation")
+    wheels: List[WheelState] = Field(..., description="All wheels in the installation")
+    slots: List[SlotState] = Field(..., description="Flattened slot view across all wheels")
 
     # Queues
     arrival_queue: List[QueuedCar] = Field(..., description="Cars waiting to be parked")
@@ -108,8 +154,8 @@ class RPOEObservation(Observation):
 
 class RPOEState(State):
     # State provides: episode_id, step_count
-    slots: List[SlotState] = Field(..., description="Current occupancy of all 12 wheel slots")
-    front_slot_index: int = Field(..., description="Index of the front slot (always 0 after normalisation)")
+    wheels: List[WheelState] = Field(..., description="Current occupancy of all wheels")
+    slots: List[SlotState] = Field(..., description="Flattened slot view across all wheels")
     arrival_queue: List[QueuedCar] = Field(..., description="Cars waiting to be parked")
     retrieval_queue: List[PendingRetrieval] = Field(..., description="Cars that have requested exit")
     hour: float = Field(..., description="Simulated hour-of-day (0.0–18.0)")
