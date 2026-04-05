@@ -108,7 +108,9 @@ def run_task(task_id: str, seed: int = 42) -> TaskResult:
         )
 
     def random_agent(_):
-        return RPOEAction(action=random.choice(list(ActionType)), wheel_index=0)
+        action = random.choice(list(ActionType))
+        wheel_index = None if action == ActionType.IDLE else random.randrange(WHEEL_COUNT)
+        return RPOEAction(action=action, wheel_index=wheel_index)
 
     return TASKS[task_id](random_agent, seed=seed)
 

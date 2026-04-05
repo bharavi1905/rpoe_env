@@ -9,8 +9,7 @@ LLM call reduction: ~1080 → ~50-100 calls for Task 3.
 Required env vars:
   API_BASE_URL  — LLM API endpoint (default: OpenAI)
   MODEL_NAME    — model identifier  (default: gpt-4o-mini)
-    HF_TOKEN      — API key for the LLM provider (preferred)
-    API_KEY       — fallback API key for backward compatibility
+  HF_TOKEN      — API key for the LLM provider
 
 Usage:
   python inference.py
@@ -26,7 +25,6 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from anthropic import Anthropic
 
 # ---------------------------------------------------------------------------
 # Bootstrap path so we can import without installing
@@ -44,23 +42,15 @@ from tasks.graders import TASKS
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
-API_KEY      = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY", "")
+HF_TOKEN     = os.environ.get("HF_TOKEN")
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "8"))
 LLM_RETRIES = max(1, int(os.environ.get("LLM_RETRIES", "1")))
 LLM_BACKOFF_SECONDS = float(os.environ.get("LLM_BACKOFF_SECONDS", "0.25"))
 
-if not API_KEY:
-    print("[WARN] HF_TOKEN/API_KEY not set — will run heuristic baseline only.")
+if not HF_TOKEN:
+    print("[WARN] HF_TOKEN not set — will run heuristic baseline only.")
 
-# Detect which API to use based on API_BASE_URL
-IS_ANTHROPIC = "anthropic" in API_BASE_URL.lower()
-
-if IS_ANTHROPIC:
-    client = Anthropic(api_key=API_KEY or "sk-placeholder")
-    print("[INFO] Using Anthropic API")
-else:
-    client = OpenAI(api_key=API_KEY or "sk-placeholder", base_url=API_BASE_URL)
-    print("[INFO] Using OpenAI-compatible API")
+client = OpenAI(api_key=HF_TOKEN or "sk-placeholder", base_url=API_BASE_URL)
 
 # ---------------------------------------------------------------------------
 # System prompt — goal-level decisions only
@@ -200,7 +190,8 @@ def execute_goal(obs: RPOEObservation, goal: dict) -> RPOEAction:
     # Truly idle: use IDLE action to avoid wasting budget and incurring illegal penalties
     if obs.arrival_queue or obs.retrieval_queue:
         fallback_wheel = goal.get("target_wheel_index")
-        if not isinstance(fallback_wheel, int):
+        wheel_count = len(obs.wheels)
+        if not isinstance(fallback_wheel, int) or fallback_wheel < 0 or fallback_wheel >= wheel_count:
             fallback_wheel = 0
         return RPOEAction(action=ActionType.ROTATE_CW, wheel_index=fallback_wheel)
     return RPOEAction(action=ActionType.IDLE, wheel_index=None)
@@ -264,10 +255,13 @@ def _apply_goal_metadata(obs: RPOEObservation, goal: dict) -> dict:
 
     target_slot = g.get("target_slot")
     target_wheel = g.get("target_wheel_index")
+    wheel_count = len(obs.wheels)
     if goal_type in {"retrieve", "park"} and isinstance(target_slot, int):
         target_slot = target_slot % NUM_SLOTS
         g["target_slot"] = target_slot
         if isinstance(target_wheel, int):
+            if target_wheel < 0 or target_wheel >= wheel_count:
+                target_wheel = None
             g["target_wheel_index"] = target_wheel
         g["direction"] = None
     else:
@@ -316,6 +310,10 @@ def _normalize_goal(parsed: Any) -> dict:
     elif isinstance(raw_wheel, str) and raw_wheel.strip().lstrip("-").isdigit():
         target_wheel = int(raw_wheel.strip())
     else:
+        target_wheel = None
+
+    # Clamp to valid range; None stays None (resolved later by _apply_goal_metadata)
+    if isinstance(target_wheel, int) and target_wheel < 0:
         target_wheel = None
 
     return {"goal": goal, "target_wheel_index": target_wheel, "target_slot": target_slot, "target_car_id": None}
@@ -381,27 +379,14 @@ def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
 
     for attempt in range(retries):
         try:
-            if IS_ANTHROPIC:
-                # Use Anthropic API
-                resp = client.messages.create(
-                    model=MODEL_NAME,
-                    max_tokens=200,
-                    messages=[
-                        {"role": "user", "content": GOAL_SYSTEM_PROMPT + "\n\nSTATE:\n" + prompt},
-                    ],
-                    timeout=LLM_TIMEOUT_SECONDS,
-                )
-                raw = (resp.content[0].text or "").strip()
-            else:
-                # Use OpenAI-compatible API
-                resp = client.chat.completions.create(
+            resp = client.chat.completions.create(
                     model=MODEL_NAME,
                     messages=[
                         {"role": "user", "content": GOAL_SYSTEM_PROMPT + "\n\nSTATE:\n" + prompt},
                     ],
                     timeout=LLM_TIMEOUT_SECONDS,
                 )
-                raw = (resp.choices[0].message.content or "").strip()
+            raw = (resp.choices[0].message.content or "").strip()
             
             if not raw:
                 raise ValueError("Empty response from model")
@@ -433,7 +418,7 @@ def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
 
 
 def _heuristic_goal(obs: RPOEObservation) -> dict:
-    """Derive goal deterministically — used as fallback and when API_KEY absent."""
+    """Derive goal deterministically — used as fallback and when HF_TOKEN absent."""
     # Match the prompt policy: retrieve-now, then immediate park, then rotate goals.
     if (
         obs.retrieval_queue
@@ -598,7 +583,7 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
             return _logged
 
         t0      = time.time()
-        result  = TASKS[task_id](agent_fn=_make_logged(agent), seed=None)
+        result  = TASKS[task_id](agent_fn=_make_logged(agent), seed=42)
         elapsed = time.time() - t0
 
         results[task_id] = result
@@ -647,7 +632,7 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    use_llm = bool(API_KEY)
+    use_llm = bool(HF_TOKEN)
     if not use_llm:
-        print("[INFO] No API_KEY — running heuristic baseline (no LLM calls).")
+        print("[INFO] No HF_TOKEN — running heuristic baseline (no LLM calls).")
     run_all_tasks(use_llm=use_llm)

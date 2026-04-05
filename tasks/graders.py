@@ -257,8 +257,12 @@ TASKS: Dict[str, Callable] = {
 if __name__ == "__main__":
     import random
 
+    wheel_count = RotaryParkingEnv().wheel_count
+
     def random_agent(_):
-        return RPOEAction(action=random.choice(list(ActionType)), wheel_index=0)
+        action = random.choice(list(ActionType))
+        wheel_index = None if action == ActionType.IDLE else random.randrange(wheel_count)
+        return RPOEAction(action=action, wheel_index=wheel_index)
 
     for task_id, fn in TASKS.items():
         result = fn(random_agent, seed=42)

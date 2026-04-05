@@ -96,11 +96,11 @@ Invalid actions (e.g. `park` when front slot is occupied) incur a −2.0 penalty
 
 | Field | Type | Description |
 |---|---|---|
-| `slots` | `list[SlotState]` | 12 wheel slots. Index 0 = front/accessible slot. Each slot has `index`, `occupied`, `car_id`. |
-| `front_slot_occupied` | `bool` | Whether slot 0 currently holds a car |
-| `front_car_id` | `str \| null` | Car ID at the front slot, or null if empty |
+| `wheel_count` | `int` | Number of wheels in the installation (7) |
+| `wheels` | `list[WheelState]` | Per-wheel state. Each has `wheel_index`, `front_slot_index`, `front_slot_occupied`, `front_car_id`, and `slots` (12 `SlotState` entries). |
+| `slots` | `list[SlotState]` | Flattened view of all 84 slots (7 wheels × 12). Each has `wheel_index`, `index`, `occupied`, `car_id`. Index 0 = front/accessible slot per wheel. |
 | `arrival_queue` | `list[QueuedCar]` | Cars waiting to be parked (max 10). Each has `car_id`, `arrival_step`. |
-| `retrieval_queue` | `list[PendingRetrieval]` | Cars requesting exit (max 10, strict FIFO). Each has `car_id`, `slot_index`, `requested_at_step`. |
+| `retrieval_queue` | `list[PendingRetrieval]` | Cars requesting exit (max 10, strict FIFO). Each has `car_id`, `wheel_index`, `slot_index`, `requested_at_step`. |
 | `step` | `int` | Current simulation step [0, 1080] |
 | `hour` | `float` | Simulated hour-of-day [0.0, 18.0] |
 | `total_parked` | `int` | Cumulative cars successfully parked this episode |
@@ -169,10 +169,10 @@ Scores for the hybrid LLM + heuristic agent (seed=42, `gpt-4o-mini`):
 
 | Task | Score | Status | Notes |
 |---|---|---|---|
-| `task1_easy` | **1.0000** | PASS | 7 ops, 6 rotations, 0 illegal actions |
-| `task2_medium` | **0.6667** | PASS | 46 served, 23 overflowed, 112 rotations |
-| `task3_hard` | **0.8986** | PASS | 256 served, 44 overflowed; T=0.85 E=1.00 R=0.97 S=0.76 |
-| **Average** | **0.8551** | | |
+| `task1_easy` | **1.0000** | PASS | seed=42, gpt-4o-mini |
+| `task2_medium` | **0.9054** | PASS | seed=42, gpt-4o-mini |
+| `task3_hard` | **0.9016** | PASS | seed=42, gpt-4o-mini |
+| **Average** | **0.9357** | | runtime: 320.9s |
 
 ---
 
@@ -180,7 +180,8 @@ Scores for the hybrid LLM + heuristic agent (seed=42, `gpt-4o-mini`):
 
 | Parameter | Value |
 |---|---|
-| Wheel size | 12 slots |
+| Wheel count | 7 independent rotary stacks |
+| Wheel size | 12 slots per wheel (84 total) |
 | Arrival process | Poisson with time-varying rate λ(t) |
 | Dwell time | LogNormal(μ=60 steps, σ=30 steps) |
 | Overflow timeout | 15 steps |
@@ -195,7 +196,7 @@ Scores for the hybrid LLM + heuristic agent (seed=42, `gpt-4o-mini`):
 | Endpoint | Method | Description |
 |---|---|---|
 | `/reset` | POST | Reset environment, returns initial observation |
-| `/step` | POST | Execute action `{"action": "rotate_cw"}`, returns observation |
+| `/step` | POST | Execute action `{"action": {"action": "rotate_cw", "wheel_index": 0}}`, returns observation |
 | `/state` | GET | Get current environment state |
 | `/health` | GET | Health check — returns 200 |
 | `/tasks` | GET | List all three evaluation tasks |

@@ -1,2 +1,0 @@
-[console_scripts]
-server = rpoe_env.server.app:main
