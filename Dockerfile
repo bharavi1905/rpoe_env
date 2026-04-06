@@ -34,6 +34,7 @@ COPY --from=builder /app/models.py   /app/models.py
 COPY --from=builder /app/__init__.py /app/__init__.py
 COPY --from=builder /app/openenv.yaml /app/openenv.yaml
 COPY --from=builder /app/README.md   /app/README.md
+COPY --from=builder /app/assets      /app/assets
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
 ENV ENABLE_WEB_INTERFACE=true

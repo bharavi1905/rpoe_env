@@ -32,7 +32,7 @@ from openai import OpenAI
 sys.path.insert(0, os.path.dirname(__file__))
 load_dotenv()
 
-from server.env import RotaryParkingEnv
+from server.env import RotaryParkingEnv, TRAFFIC_MULTIPLIER
 from models import RPOEAction, ActionType, RPOEObservation, TaskResult
 from tasks.graders import TASKS
 
@@ -58,32 +58,38 @@ client = OpenAI(api_key=HF_TOKEN or "sk-placeholder", base_url=API_BASE_URL)
 
 GOAL_SYSTEM_PROMPT = """You are a high-level planner for a rotary parking system.
 
-A deterministic executor handles step-level rotation and action execution.
-Your job is only to decide WHAT to do next, not HOW to rotate.
+A deterministic executor handles step-level rotation. Your job is to decide the PRIORITY goal.
 
 STATE (JSON):
 - wheel_fronts: list of {wheel_index, front_occupied, front_car_id}
 - arrival_queue_len: number of cars waiting to park
-- retrieval_queue: list of {car_id, wheel_index, slot} — cars requesting exit
-- empty_slots: number of empty slots on the wheel
+- retrieval_queue: list of {car_id, wheel_index, slot} — cars requesting exit (FIFO enforced)
+- empty_slots: total empty slots across all wheels
 - step, hour: current simulation time
+
+PENALTY RATES (per step):
+- Each car in arrival_queue costs -1 per step
+- Each car in retrieval_queue costs -1 per step
+- Overflow (car waits > 15 steps): -5 one-time penalty
+- Rotation costs -0.5 per step
 
 GOALS — output exactly one:
     "retrieve"
     "park"
     "idle"
 
-DECISION STRATEGY (follow in order):
-1. If retrieval_queue[0] exists and its car is already at the front of its wheel -> choose "retrieve"
-2. Else if arrival_queue_len > 0 and any wheel front is empty -> choose "park"
-3. Else if retrieval_queue is non-empty -> choose "retrieve"
-4. Else if arrival_queue_len > 0 -> choose "park"
-5. Else -> choose "idle"
+DECISION STRATEGY — three-level retrieval pressure:
+1. If retrieval_queue has >= 7 cars (critical) -> "retrieve" always — near capacity, cars get silently stranded if queue fills
+2. If retrieval_queue[0] car is at the front of its wheel -> "retrieve" (free, no rotation cost)
+3. If overflow_imminent=true AND retrieval_queue < 7 -> "park" (arrival car about to be lost)
+4. If retrieval_queue >= 3 (pressure) -> "retrieve" (clear backlog before it grows)
+5. If arrival_queue_len > 0 and empty_slots > 0 -> "park"
+6. Else -> "idle"
 
 Respond with ONLY a JSON object: {"goal": "<goal>", "target_wheel": <int or null>, "target_slot": <int or null>}
 - For "retrieve": set target_wheel and target_slot from retrieval_queue[0]
 - For "park": set target_wheel to a wheel with capacity and target_slot to an empty slot index on that wheel
-- For "idle": set both target_wheel and target_slot to null
+- For "idle": set both to null
 
 No explanation. No markdown. Just the raw JSON.
 """
@@ -158,8 +164,16 @@ def execute_goal(obs: RPOEObservation, goal: dict) -> RPOEAction:
         if retrieval_wheel.front_car_id == retrieval.car_id:
             return RPOEAction(action=ActionType.RETRIEVE, wheel_index=retrieval.wheel_index)
 
-    # 2. PARK immediately if front is empty and cars are waiting
-    if obs.arrival_queue:
+    # 2. PARK immediately if front is empty and cars are waiting.
+    # Three-level retrieval queue policy:
+    #   < 3  — low pressure: park freely
+    #   3–6  — pressure: park only if a car is close to overflowing (>=10 steps waited)
+    #   >= 7 — critical: always retrieve; parking overflow < stranded cars (never retrieved)
+    retrieval_pressure = len(obs.retrieval_queue) >= 3
+    retrieval_critical = len(obs.retrieval_queue) >= 7
+    oldest_wait = max((obs.step - car.arrival_step for car in obs.arrival_queue), default=0)
+    overflow_imminent = oldest_wait >= 10
+    if obs.arrival_queue and ((overflow_imminent and not retrieval_critical) or not retrieval_pressure):
         front_empty_wheel = _first_front_empty_wheel(obs)
         if front_empty_wheel is not None:
             return RPOEAction(action=ActionType.PARK, wheel_index=front_empty_wheel)
@@ -351,6 +365,7 @@ def _obs_to_goal_prompt(obs: RPOEObservation) -> str:
         for r in obs.retrieval_queue[:3]
     ]
     empty_slots = [s for s in obs.slots if not s.occupied]
+    oldest_wait = max((obs.step - car.arrival_step for car in obs.arrival_queue), default=0)
     data = {
         "step":              obs.step,
         "hour":              obs.hour,
@@ -363,6 +378,8 @@ def _obs_to_goal_prompt(obs: RPOEObservation) -> str:
             for wheel in obs.wheels
         ],
         "arrival_queue_len": len(obs.arrival_queue),
+        "oldest_arrival_wait": oldest_wait,
+        "overflow_imminent":  oldest_wait >= 10,
         "retrieval_queue":   ret_q,
         "empty_slots":       len(empty_slots),
         "empty_slot_indices": [
@@ -419,7 +436,21 @@ def llm_agent(obs: RPOEObservation, retries: int = LLM_RETRIES) -> dict:
 
 def _heuristic_goal(obs: RPOEObservation) -> dict:
     """Derive goal deterministically — used as fallback and when HF_TOKEN absent."""
-    # Match the prompt policy: retrieve-now, then immediate park, then rotate goals.
+    retrieval_pressure = len(obs.retrieval_queue) >= 3
+
+    # Retrieve immediately if retrieval queue is under pressure
+    if retrieval_pressure and obs.retrieval_queue:
+        return _apply_goal_metadata(
+            obs,
+            {
+                "goal": "retrieve",
+                "target_wheel_index": obs.retrieval_queue[0].wheel_index,
+                "target_slot": obs.retrieval_queue[0].slot_index,
+                "target_car_id": obs.retrieval_queue[0].car_id,
+            },
+        )
+
+    # Free retrieval — car already at front, no rotation cost
     if (
         obs.retrieval_queue
         and _get_wheel(obs, obs.retrieval_queue[0].wheel_index).front_car_id == obs.retrieval_queue[0].car_id
@@ -434,7 +465,12 @@ def _heuristic_goal(obs: RPOEObservation) -> dict:
             },
         )
 
-    if obs.arrival_queue:
+    # Park immediately if a free front exists, using the same three-level
+    # retrieval pressure policy as execute_goal.
+    retrieval_critical = len(obs.retrieval_queue) >= 7
+    oldest_wait = max((obs.step - car.arrival_step for car in obs.arrival_queue), default=0)
+    overflow_imminent = oldest_wait >= 10
+    if obs.arrival_queue and ((overflow_imminent and not retrieval_critical) or not retrieval_pressure):
         front_empty_wheel = _first_front_empty_wheel(obs)
         if front_empty_wheel is not None:
             return _apply_goal_metadata(
@@ -442,7 +478,8 @@ def _heuristic_goal(obs: RPOEObservation) -> dict:
                 {"goal": "park", "target_wheel_index": front_empty_wheel, "target_slot": 0, "target_car_id": None},
             )
 
-    if obs.retrieval_queue:
+    # Retrieval takes priority over parking rotation when arrival queue is small
+    if obs.retrieval_queue and len(obs.arrival_queue) <= 2:
         return _apply_goal_metadata(
             obs,
             {
@@ -551,10 +588,10 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
     results = {}
 
     task_configs = [
-        ("task1_easy",   ""
-        ""),
-        ("task2_medium", "Medium — Peak-hour throughput (180 steps)"),
-        ("task3_hard",   "Hard   — Full day composite (1080 steps)"),
+        # (task_id, label, steps, simulated_window, effective_lambda)
+        ("task1_easy",   "Easy   — Rotation efficiency",          50,   "5–6 AM (quiet)",        "λ=0.15/step"),
+        ("task2_medium", "Medium — Peak-hour throughput",         180,  "6–9 AM (morning peak)", "λ=0.53/step"),
+        ("task3_hard",   "Hard   — Full day composite",           1080, "5 AM–11 PM (full day)", "λ=0.08–0.53/step"),
     ]
 
     print("\n" + "=" * 60)
@@ -567,12 +604,12 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
     total_start = time.time()
     completed_scores: list = []
 
-    for task_id, label in task_configs:
+    for task_id, label, steps, window, lam in task_configs:
         # Fresh agent per task — resets goal state and cache
         use_llm_for_task = use_llm and task_id != "task1_easy"
         agent = HybridAgent(use_llm=use_llm_for_task)
 
-        print(f"\n[{label}]")
+        print(f"\n[{label}]  {steps} steps | {window} | {lam}")
         print(f"[START] task_id={task_id} model={MODEL_NAME}")
 
         def _make_logged(inner):
@@ -601,18 +638,23 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
 
     total_elapsed = time.time() - total_start
 
-    print("\n" + "=" * 60)
+    task_meta = {tid: (w, l) for tid, _, _, w, l in task_configs}
+    print("\n" + "=" * 70)
     print("  FINAL SCORES")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"  {'Task':<18} {'Score':>6}  {'Bar':<22}  Window & Traffic")
+    print(f"  {'-'*18} {'-'*6}  {'-'*22}  {'-'*24}")
     for task_id, result in results.items():
         bar_len = int(result.score * 20)
         bar     = "█" * bar_len + "░" * (20 - bar_len)
-        print(f"  {task_id:<18} {bar}  {result.score:.4f}")
+        window, lam = task_meta[task_id]
+        print(f"  {task_id:<18} {result.score:.4f}  {bar}  {window} ({lam})")
 
     avg_score = sum(r.score for r in results.values()) / len(results)
-    print(f"\n  Average score: {avg_score:.4f}")
-    print(f"  Total runtime: {total_elapsed:.1f}s  (limit: 1200s)")
-    print("=" * 60 + "\n")
+    print(f"\n  Average score : {avg_score:.4f}")
+    print(f"  Total runtime : {total_elapsed:.1f}s  (limit: 1200s)")
+    print(f"  Traffic scale : {TRAFFIC_MULTIPLIER}x baseline  (7 wheels × 12 slots = 84 total)")
+    print("=" * 70 + "\n")
 
     output = {
         "scores":    {tid: r.score for tid, r in results.items()},

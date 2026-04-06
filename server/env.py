@@ -34,7 +34,7 @@ MAX_ARRIVAL_Q    = 10          # max cars waiting outside
 MAX_RETRIEVAL_Q  = 10          # max pending retrievals
 MAX_STEPS        = 1080        # 18-hour day in 1-min steps (5 AM – 11 PM)
 OVERFLOW_TIMEOUT = 15          # steps before queued car overflows (rage-leaves)
-TRAFFIC_MULTIPLIER = 1.0       # scales the baseline arrival rates
+TRAFFIC_MULTIPLIER = 1.5       # scales the baseline arrival rates
 
 # Poisson arrival rates (cars/step) by hour-of-day band
 ARRIVAL_RATES = [

@@ -67,8 +67,8 @@ action_space:
 
 reward:
   type: float
-  min: -20.0
-  max: 5.0
+  min: -22.5
+  max: 3.0
   components:
     waiting_penalty:  "-1.0 per car in arrival + retrieval queues (per step)"
     rotation_penalty: "-0.5 per rotation action"
