@@ -188,10 +188,10 @@ Hybrid LLM + heuristic agent · `seed=42` · `gpt-4o-mini` · `TRAFFIC_MULTIPLIE
 
 | Task | Steps | Traffic | Score | Status |
 |---|---|---|---|---|
-| `task1_easy` | 50 | λ=0.15/step | **1.0000** | PASS |
+| `task1_easy` | 50 | λ=0.15/step | **0.9990** | PASS |
 | `task2_medium` | 180 | λ=0.525/step (peak) | **0.6796** | PASS |
 | `task3_hard` | 1080 | λ=0.075–0.525/step | **0.8160** | PASS |
-| **Average** | | | **0.8319** | runtime: 286.7s |
+| **Average** | | | **0.8315** | runtime: 358.8s |
 
 Task 3 breakdown: Throughput 0.80 · Efficiency 1.00 · Retrieval 0.90 · Stability 0.45 · avg queue 5.52
 

@@ -16,6 +16,11 @@ from server.env import RotaryParkingEnv
 from models import RPOEAction, ActionType, TaskResult
 
 
+def _open_score(score: float) -> float:
+    """Clamp to open interval (0, 1) — validator rejects exact 0.0 or 1.0."""
+    return round(max(0.001, min(0.999, score)), 4)
+
+
 # ---------------------------------------------------------------------------
 # Task 1 — Easy: Optimal rotation planning
 # ---------------------------------------------------------------------------
@@ -64,7 +69,7 @@ def run_task1(agent_fn: Callable, seed: int = 0) -> TaskResult:
     excess = max(0, rotation_count - expected_rotations)
     rotation_score = max(0.0, 1.0 - (excess / max(expected_rotations, 1)))
     illegal_score  = max(0.0, 1.0 - (illegal_count / 10))
-    score = round(0.6 * rotation_score + 0.4 * illegal_score, 4)
+    score = _open_score(0.6 * rotation_score + 0.4 * illegal_score)
 
     return TaskResult(
         task_id="task1_easy",
@@ -127,7 +132,7 @@ def run_task2(agent_fn: Callable, seed: int = 0) -> TaskResult:
     rot_penalty = max(0.0, (rotation_count - rot_budget) / max(rot_budget, 1))
     rot_penalty = min(rot_penalty, 0.3)
 
-    score = round(max(0.0, throughput_score - rot_penalty), 4)
+    score = _open_score(max(0.0, throughput_score - rot_penalty))
 
     return TaskResult(
         task_id="task2_medium",
@@ -206,12 +211,11 @@ def run_task3(agent_fn: Callable, seed: int = 0) -> TaskResult:
     avg_queue = sum(queue_lengths) / max(len(queue_lengths), 1)
     stability = max(0.0, 1.0 - avg_queue / 10.0)
 
-    score = round(
+    score = _open_score(
         0.40 * throughput
         + 0.25 * efficiency
         + 0.20 * retrieval_score
-        + 0.15 * stability,
-        4,
+        + 0.15 * stability
     )
 
     return TaskResult(

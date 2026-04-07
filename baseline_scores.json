@@ -1,6 +1,6 @@
 {
   "scores": {
-    "task1_easy": 1.0,
+    "task1_easy": 0.999,
     "task2_medium": 0.6796,
     "task3_hard": 0.816
   },
@@ -34,6 +34,6 @@
       "avg_queue_len": 5.52
     }
   },
-  "avg_score": 0.8318666666666666,
+  "avg_score": 0.8315333333333333,
   "model": "gpt-4o-mini"
 }
