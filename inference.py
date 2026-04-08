@@ -590,8 +590,8 @@ def run_all_tasks(use_llm: bool = True) -> Dict[str, TaskResult]:
     task_configs = [
         # (task_id, label, steps, simulated_window, effective_lambda)
         ("task1_easy",   "Easy   — Rotation efficiency",          50,   "5–6 AM (quiet)",        "λ=0.15/step"),
-        ("task2_medium", "Medium — Peak-hour throughput",         180,  "6–9 AM (morning peak)", "λ=0.53/step"),
-        ("task3_hard",   "Hard   — Full day composite",           1080, "5 AM–11 PM (full day)", "λ=0.08–0.53/step"),
+        ("task2_medium", "Medium — Full day composite",            1080, "5 AM–11 PM (full day)", "λ=0.08–0.53/step"),
+        ("task3_hard",   "Hard   — Peak-hour throughput",         180,  "6–9 AM (morning peak)", "λ=0.35/step"),
     ]
 
     print("\n" + "=" * 60)

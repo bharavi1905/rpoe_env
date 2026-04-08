@@ -128,9 +128,9 @@ All tasks run with `seed=42` for full reproducibility.
 
 ### Task 1 — Easy: Rotation Efficiency (50 steps)
 
-**Simulates:** Quiet opening hour · λ = 0.15/step · No overflow risk
+**Simulates:** High-arrival stress · λ = 0.50/step · Rotation path optimisation
 
-Tests whether the agent takes the shortest rotation path when servicing operations, and avoids illegal actions.
+Tests whether the agent takes the shortest rotation path when servicing operations, and avoids illegal actions. With λ=0.50, wheels fill quickly and meaningful rotation decisions are required within the short horizon.
 
 ```
 rotation_score = max(0, 1 − max(0, actual_rotations − expected_rotations) / expected_rotations)
@@ -138,31 +138,13 @@ illegal_score  = max(0, 1 − illegal_count / 10)
 score          = 0.6 × rotation_score + 0.4 × illegal_score
 ```
 
-`expected_rotations = successful_ops × 3` (average 3 rotations per op for uniformly distributed slots).
+`expected_rotations = max(1, int(successful_ops × 0.53))` — tight budget rewards minimal-path routing.
 
 **Pass threshold: 0.40** (≈1.5× random agent) · **LLM bypassed** — heuristic is optimal at this horizon.
 
 ---
 
-### Task 2 — Medium: Peak-Hour Throughput (180 steps)
-
-**Simulates:** Morning peak 6–9 AM · λ = 0.525/step · Overflow pressure
-
-Tests sustained throughput under high arrival rate. With a 15-step overflow timeout, the agent must continuously drain the arrival queue.
-
-```
-throughput_score = served / (served + overflowed)       where served = parked + retrieved
-rotation_penalty = min(0.30, max(0, (rotations − served × 4) / (served × 4)))
-score            = throughput_score − rotation_penalty
-```
-
-Rotation penalty is capped at 0.30 — efficiency matters but throughput dominates.
-
-**Pass threshold: 0.50** (≈1.5× random agent)
-
----
-
-### Task 3 — Hard: Full 18-Hour Day (1080 steps)
+### Task 2 — Medium: Full 18-Hour Day (1080 steps)
 
 **Simulates:** 5 AM–11 PM full operating day · λ = 0.075–0.525/step (time-varying)
 
@@ -178,7 +160,25 @@ score      = 0.40 × throughput + 0.25 × efficiency + 0.20 × retrieval + 0.15 
 
 **Why retrieval matters:** the retrieval queue has a hard cap of 10. If it fills, new retrieval requests are silently dropped — the car is physically stranded. An agent that only parks will collapse on this dimension.
 
-**Pass threshold: 0.55** (≈1.5× random agent)
+**Pass threshold: 0.60** (≈1.5× random agent)
+
+---
+
+### Task 3 — Hard: Peak-Hour Throughput (180 steps)
+
+**Simulates:** Morning peak 6–9 AM · λ = 0.35/step constant · No quiet-period recovery
+
+Tests sustained throughput under constant high-pressure arrivals. Unlike the full-day task, there are no quiet hours to drain backlog — the agent must continuously handle overflow risk from step 1.
+
+```
+throughput_score = served / (served + overflowed)       where served = parked + retrieved
+rotation_penalty = min(0.30, max(0, (rotations − served × 4) / (served × 4)))
+score            = throughput_score − rotation_penalty
+```
+
+Rotation penalty is capped at 0.30 — efficiency matters but throughput dominates.
+
+**Pass threshold: 0.50** (≈1.5× random agent)
 
 ---
 
@@ -188,12 +188,12 @@ Hybrid LLM + heuristic agent · `seed=42` · `gpt-4o-mini` · `TRAFFIC_MULTIPLIE
 
 | Task | Steps | Traffic | Score | Status |
 |---|---|---|---|---|
-| `task1_easy` | 50 | λ=0.15/step | **0.9990** | PASS |
-| `task2_medium` | 180 | λ=0.525/step (peak) | **0.6796** | PASS |
-| `task3_hard` | 1080 | λ=0.075–0.525/step | **0.8160** | PASS |
-| **Average** | | | **0.8315** | runtime: 358.8s |
+| `task1_easy` | 50 | λ=0.50/step | **0.9077** | PASS |
+| `task2_medium` | 1080 | λ=0.075–0.525/step (full day) | **0.8160** | PASS |
+| `task3_hard` | 180 | λ=0.35/step (constant peak) | **0.6796** | PASS |
+| **Average** | | | **0.8011** | runtime: 470.9s |
 
-Task 3 breakdown: Throughput 0.80 · Efficiency 1.00 · Retrieval 0.90 · Stability 0.45 · avg queue 5.52
+Task 2 breakdown: Throughput 0.80 · Efficiency 1.00 · Retrieval 0.90 · Stability 0.45 · avg queue 5.52
 
 ---
 

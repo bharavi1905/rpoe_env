@@ -1,27 +1,19 @@
 {
   "scores": {
-    "task1_easy": 0.999,
-    "task2_medium": 0.6796,
-    "task3_hard": 0.816
+    "task1_easy": 0.9077,
+    "task2_medium": 0.816,
+    "task3_hard": 0.6796
   },
   "metrics": {
     "task1_easy": {
-      "total_reward": 4.0,
-      "rotation_count": 2.0,
-      "successful_ops": 9.0,
+      "total_reward": -173.5,
+      "rotation_count": 15.0,
+      "successful_ops": 26.0,
       "illegal_actions": 0.0,
-      "rotation_score": 1.0,
+      "rotation_score": 0.8462,
       "illegal_score": 1.0
     },
     "task2_medium": {
-      "total_reward": -1718.0,
-      "cars_parked": 45.0,
-      "cars_retrieved": 25.0,
-      "cars_overflowed": 33.0,
-      "throughput_score": 0.6796,
-      "rotation_count": 98.0
-    },
-    "task3_hard": {
       "total_reward": -5845.0,
       "cars_parked": 167.0,
       "cars_retrieved": 151.0,
@@ -32,8 +24,16 @@
       "retrieval_score": 0.9042,
       "stability_score": 0.4481,
       "avg_queue_len": 5.52
+    },
+    "task3_hard": {
+      "total_reward": -1718.0,
+      "cars_parked": 45.0,
+      "cars_retrieved": 25.0,
+      "cars_overflowed": 33.0,
+      "throughput_score": 0.6796,
+      "rotation_count": 98.0
     }
   },
-  "avg_score": 0.8315333333333333,
+  "avg_score": 0.8010999999999999,
   "model": "gpt-4o-mini"
 }

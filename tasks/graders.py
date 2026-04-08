@@ -34,10 +34,9 @@ def run_task1(agent_fn: Callable, seed: int = 0) -> TaskResult:
     Score = 1 - clamp(excess_rotations / budget, 0, 1)
     """
     env = RotaryParkingEnv(seed=seed, max_steps=50, wheel_size=12)
-    # Override arrival rate to be gentle
     import server.env as emod
     _orig = emod._arrival_rate
-    emod._arrival_rate = lambda h: 0.10
+    emod._arrival_rate = lambda h: 0.50
 
     obs = env.reset()
     total_reward       = 0.0
@@ -65,7 +64,7 @@ def run_task1(agent_fn: Callable, seed: int = 0) -> TaskResult:
     emod._arrival_rate = _orig
 
     # Scoring: penalise excess rotations and illegal moves
-    expected_rotations = max(1, successful_ops) * 3
+    expected_rotations = max(1, int(successful_ops * 0.53))
     excess = max(0, rotation_count - expected_rotations)
     rotation_score = max(0.0, 1.0 - (excess / max(expected_rotations, 1)))
     illegal_score  = max(0.0, 1.0 - (illegal_count / 10))
@@ -96,70 +95,7 @@ def run_task1(agent_fn: Callable, seed: int = 0) -> TaskResult:
 
 def run_task2(agent_fn: Callable, seed: int = 0) -> TaskResult:
     """
-    Medium task: 180-step morning peak simulation (6–9 AM, λ=0.35).
-    Agent is scored on cars served vs cars that overflowed.
-
-    Score = served / (served + overflowed), penalised for excess rotations.
-    """
-    env = RotaryParkingEnv(seed=seed, max_steps=180, wheel_size=12)
-    # Force peak-hour arrivals
-    import server.env as emod
-    _orig = emod._arrival_rate
-    emod._arrival_rate = lambda h: 0.35
-
-    obs = env.reset()
-    total_reward = 0.0
-    rotation_count = 0
-
-    for _ in range(180):
-        action = agent_fn(obs)
-        obs = env.step(action)
-        total_reward += obs.reward
-        if action.action in (ActionType.ROTATE_CW, ActionType.ROTATE_CCW):
-            rotation_count += 1
-        if obs.done:
-            break
-
-    emod._arrival_rate = _orig
-
-    served     = obs.total_parked + obs.total_retrieved
-    overflowed = obs.total_overflowed
-    total_ops  = served + overflowed
-
-    throughput_score = served / max(total_ops, 1)
-
-    rot_budget  = max(1, served) * 4
-    rot_penalty = max(0.0, (rotation_count - rot_budget) / max(rot_budget, 1))
-    rot_penalty = min(rot_penalty, 0.3)
-
-    score = _open_score(max(0.0, throughput_score - rot_penalty))
-
-    return TaskResult(
-        task_id="task2_medium",
-        score=score,
-        metrics={
-            "total_reward":     round(total_reward, 2),
-            "cars_parked":      obs.total_parked,
-            "cars_retrieved":   obs.total_retrieved,
-            "cars_overflowed":  overflowed,
-            "throughput_score": round(throughput_score, 4),
-            "rotation_count":   rotation_count,
-        },
-        passed=score >= 0.5,
-        notes=(
-            f"Served {served} cars, {overflowed} overflowed "
-            f"({rotation_count} rotations in peak hour)."
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Task 3 — Hard: Full-day composite score
-# ---------------------------------------------------------------------------
-
-def run_task3(agent_fn: Callable, seed: int = 0) -> TaskResult:
-    """
-    Hard task: Full 1080-step day (5 AM–11 PM), all demand bands active.
+    Medium task: Full 1080-step day (5 AM–11 PM), all demand bands active.
     Composite score across four dimensions:
 
       1. Throughput   (40%) — cars served / (served + overflowed)
@@ -219,7 +155,7 @@ def run_task3(agent_fn: Callable, seed: int = 0) -> TaskResult:
     )
 
     return TaskResult(
-        task_id="task3_hard",
+        task_id="task2_medium",
         score=score,
         metrics={
             "total_reward":     round(total_reward, 2),
@@ -233,12 +169,77 @@ def run_task3(agent_fn: Callable, seed: int = 0) -> TaskResult:
             "stability_score":  round(stability, 4),
             "avg_queue_len":    round(avg_queue, 2),
         },
-        passed=score >= 0.55,
+        passed=score >= 0.60,
         notes=(
             f"Full-day: {parked} parked, {retrieved} retrieved, "
             f"{overflowed} overflowed. Score breakdown: "
             f"T={throughput:.2f} E={efficiency:.2f} "
             f"R={retrieval_score:.2f} S={stability:.2f}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 3 — Hard: Peak-hour throughput
+# ---------------------------------------------------------------------------
+
+def run_task3(agent_fn: Callable, seed: int = 0) -> TaskResult:
+    """
+    Hard task: 180-step morning peak simulation (6–9 AM, λ=0.35).
+    Constant high-pressure arrivals with no quiet-hour recovery.
+    Agent is scored on cars served vs cars that overflowed,
+    penalised for excess rotations.
+
+    Score = served / (served + overflowed) - rotation_penalty
+    """
+    env = RotaryParkingEnv(seed=seed, max_steps=180, wheel_size=12)
+    # Force constant peak-hour arrivals — no quiet periods to recover
+    import server.env as emod
+    _orig = emod._arrival_rate
+    emod._arrival_rate = lambda h: 0.35
+
+    obs = env.reset()
+    total_reward = 0.0
+    rotation_count = 0
+
+    for _ in range(180):
+        action = agent_fn(obs)
+        obs = env.step(action)
+        total_reward += obs.reward
+        if action.action in (ActionType.ROTATE_CW, ActionType.ROTATE_CCW):
+            rotation_count += 1
+        if obs.done:
+            break
+
+    emod._arrival_rate = _orig
+
+    served     = obs.total_parked + obs.total_retrieved
+    overflowed = obs.total_overflowed
+    total_ops  = served + overflowed
+
+    throughput_score = served / max(total_ops, 1)
+
+    rot_budget  = max(1, served) * 4
+    rot_penalty = max(0.0, (rotation_count - rot_budget) / max(rot_budget, 1))
+    rot_penalty = min(rot_penalty, 0.3)
+
+    score = _open_score(max(0.0, throughput_score - rot_penalty))
+
+    return TaskResult(
+        task_id="task3_hard",
+        score=score,
+        metrics={
+            "total_reward":     round(total_reward, 2),
+            "cars_parked":      obs.total_parked,
+            "cars_retrieved":   obs.total_retrieved,
+            "cars_overflowed":  overflowed,
+            "throughput_score": round(throughput_score, 4),
+            "rotation_count":   rotation_count,
+        },
+        passed=score >= 0.5,
+        notes=(
+            f"Served {served} cars, {overflowed} overflowed "
+            f"({rotation_count} rotations in peak hour)."
         ),
     )
 
